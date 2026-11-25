@@ -2,15 +2,17 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
+import type { Task } from "../shared/task.ts";
+import type { TaskDetails } from "./task-schema.ts";
 
 const storedTask = z.looseObject({ id: z.string(), title: z.string(), done: z.boolean() });
 const taskList = z.array(storedTask);
-type Task = z.infer<typeof storedTask>;
-type TaskChanges = Partial<Pick<Task, "title" | "done">>;
+type TaskChanges = Partial<Pick<Task, "title" | "done">> & TaskDetails;
+type TaskOptions = TaskDetails & { parentId?: string };
 
 export interface TaskStore {
   list(): Task[];
-  create(title: string): Task;
+  create(title: string, options?: TaskOptions): Task;
   update(id: string, changes: TaskChanges): Task | undefined;
   remove(id: string): boolean;
 }
@@ -32,8 +34,8 @@ export function createJsonTaskStore(filename: string): TaskStore {
   return {
     list,
 
-    create(title) {
-      const task = { id: randomUUID(), title, done: false };
+    create(title, options) {
+      const task = { id: randomUUID(), title, done: false, ...options };
       save([...list(), task]);
       return task;
     },
@@ -53,6 +55,9 @@ export function createJsonTaskStore(filename: string): TaskStore {
       const remaining = tasks.filter((task) => task.id !== id);
       if (remaining.length === tasks.length) return false;
 
+      for (const task of remaining) {
+        if (task.parentId === id) delete task.parentId;
+      }
       save(remaining);
       return true;
     },

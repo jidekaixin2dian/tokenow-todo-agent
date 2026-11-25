@@ -1,22 +1,28 @@
 import { useEffect, useRef } from "react";
 import type { ChatMessage } from "../shared/chat.ts";
 
-const examplePrompts = ["提醒我买牛奶", "看看我的待办"];
+const examplePrompts = ["提醒我买牛奶", "看看我的待办", "今天有哪些任务到期？"];
 
 interface ChatHistoryProps {
   messages: ChatMessage[];
   pending: boolean;
+  taskPanelOpen: boolean;
   onSelectPrompt: (prompt: string) => void;
 }
 
-export function ChatHistory({ messages, pending, onSelectPrompt }: ChatHistoryProps) {
+export function ChatHistory({
+  messages,
+  pending,
+  taskPanelOpen,
+  onSelectPrompt,
+}: ChatHistoryProps) {
   const viewport = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;
-  }, [messages, pending]);
+  }, [messages, pending, taskPanelOpen]);
 
   return (
-    <div className="scroll" ref={viewport}>
+    <div className="scroll" ref={viewport} role="region" aria-label="聊天内容" tabIndex={0}>
       {messages.length === 0 ? (
         <section className="welcome">
           <img src="/logo.png" alt="" />
