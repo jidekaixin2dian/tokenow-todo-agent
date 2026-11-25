@@ -37,7 +37,13 @@ export default function App() {
       setError(cause instanceof Error ? `发送失败：${cause.message}` : "发送失败，请重试。");
     } finally {
       setPending(false);
-      requestAnimationFrame(() => input.current?.focus());
+      requestAnimationFrame(() => {
+        const field = input.current;
+        const active = document.activeElement;
+        if (field && (active === document.body || field.form?.contains(active))) {
+          field.focus();
+        }
+      });
     }
   }
 

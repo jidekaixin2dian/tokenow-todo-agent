@@ -5,9 +5,9 @@ export async function requestReply(messages: ChatMessage[]): Promise<string> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ messages }),
-  });
-  const body: unknown = await response.json();
-  if (typeof body === "object" && body !== null) {
+  }).catch(() => null);
+  const body: unknown = await response?.json().catch(() => null);
+  if (response && typeof body === "object" && body !== null) {
     if (response.ok && "reply" in body && typeof body.reply === "string") return body.reply;
     if ("error" in body && typeof body.error === "string") throw new Error(body.error);
   }

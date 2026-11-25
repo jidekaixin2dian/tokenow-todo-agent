@@ -19,8 +19,7 @@ textarea {
 button {
   cursor: pointer;
 }
-button:focus-visible,
-textarea:focus-visible {
+button:focus-visible {
   outline: 2px solid #1643e7;
   outline-offset: 3px;
 }
@@ -172,8 +171,16 @@ form {
   background: white;
   box-shadow: 0 4px 18px #1b305808;
 }
-form:focus-within {
+form:has(textarea:focus) {
   border-color: #526ed8;
+}
+form:has(textarea:focus) textarea:focus {
+  outline: none;
+}
+@media (forced-colors: active) {
+  form:has(textarea:focus) {
+    border-color: Highlight;
+  }
 }
 textarea {
   border: 0;
