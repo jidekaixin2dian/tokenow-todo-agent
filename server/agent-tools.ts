@@ -11,31 +11,26 @@ import {
   sortTasksByUrgency,
   type Task,
 } from "../shared/task.ts";
-import {
-  taskDate,
-  taskDetailsUpdateFields,
-  taskEffort,
-  taskPriority,
-  taskTitle,
-} from "./task-schema.ts";
+import { taskDate, taskEffort, taskPriority, taskTitle } from "./task-schema.ts";
 import type { TaskStore } from "./task-store.ts";
 
 export interface ToolTurnState {
   mutations: string[];
-  deletedCount: number;
-  initialTaskCount: number;
-  bulkDeleteConfirmed: boolean;
+  plannedDeletes: Map<string, Pick<Task, "id" | "title">>;
+  allowWrites: boolean;
+  onlyPlanDeletion: boolean;
+  needsSeparateDeletion: boolean;
+  invalidDelete: boolean;
 }
 
-export function createToolTurnState(
-  initialTaskCount: number,
-  bulkDeleteConfirmed: boolean,
-): ToolTurnState {
+export function createToolTurnState(allowWrites = true, onlyPlanDeletion = false): ToolTurnState {
   return {
     mutations: [],
-    deletedCount: 0,
-    initialTaskCount,
-    bulkDeleteConfirmed,
+    plannedDeletes: new Map(),
+    allowWrites,
+    onlyPlanDeletion,
+    needsSeparateDeletion: false,
+    invalidDelete: false,
   };
 }
 
@@ -51,6 +46,8 @@ const optionalEffort = z.preprocess(emptyToUndefined, taskEffort.optional());
 const optionalParentId = z.preprocess(emptyToUndefined, z.string().trim().min(1).optional());
 const optionalQuery = z.preprocess(emptyToUndefined, z.string().trim().min(1).max(100).optional());
 const optionalLimit = z.preprocess(emptyToUndefined, z.number().int().min(1).max(100).optional());
+const optionalOffset = z.preprocess(emptyToUndefined, z.number().int().nonnegative().optional());
+const optionalBoolean = z.preprocess(emptyToUndefined, z.boolean().optional());
 
 const DEFAULT_LIST_LIMIT = 50;
 
@@ -64,6 +61,7 @@ const listTasksArgsSchema = z.object({
   effort: optionalEffort,
   query: optionalQuery,
   limit: optionalLimit,
+  offset: optionalOffset,
 });
 
 const createTasksArgsSchema = z.object({
@@ -85,11 +83,13 @@ const updateTaskArgsSchema = z
   .object({
     id: z.string().trim().min(1),
     title: z.preprocess(emptyToUndefined, taskTitle.optional()),
-    done: z.preprocess((v) => (v === null ? undefined : v), z.boolean().optional()),
-    ...taskDetailsUpdateFields,
-    clearDueDate: z.boolean().optional(),
-    clearPriority: z.boolean().optional(),
-    clearEffort: z.boolean().optional(),
+    done: optionalBoolean,
+    dueDate: optionalDate,
+    priority: optionalPriority,
+    effort: optionalEffort,
+    clearDueDate: optionalBoolean,
+    clearPriority: optionalBoolean,
+    clearEffort: optionalBoolean,
   })
   .refine(
     ({ title, done, dueDate, priority, effort, clearDueDate, clearPriority, clearEffort }) =>
@@ -147,6 +147,11 @@ export const agentTools: ChatCompletionTool[] = [
             minimum: 1,
             maximum: 100,
             description: "返回任务条数上限，默认 50，最大 100。",
+          },
+          offset: {
+            type: "integer",
+            minimum: 0,
+            description: "跳过的匹配条数，默认 0。继续读取时保持此前的筛选条件并使用 nextOffset。",
           },
         },
         additionalProperties: false,
@@ -239,7 +244,7 @@ export const agentTools: ChatCompletionTool[] = [
     function: {
       name: "delete_task",
       description:
-        "按精确 id 删除单条任务。删除主任务时，其子任务会自动转为独立任务。单轮删除 3 条及以上或清空整张清单前，必须先获得用户明确确认，否则服务端会拒绝执行。",
+        "将一个精确 id 加入本轮删除计划，服务端会在收集完全部目标后统一处理。批量删除或清空需要用户确认。工具返回计划，不代表任务已删除。删除主任务时，其子任务会自动转为独立任务。",
       parameters: {
         type: "object",
         properties: {
@@ -305,10 +310,29 @@ export function executeAgentTool(
   tasks: TaskStore,
   now: Date,
   today: string,
-  turnState: ToolTurnState = createToolTurnState(tasks.list().length, false),
+  turnState: ToolTurnState = createToolTurnState(),
 ): Record<string, unknown> {
+  if (
+    !turnState.allowWrites &&
+    (name === "create_tasks" || name === "update_task" || name === "delete_task")
+  ) {
+    return { ok: false, error: "本轮只读取清单，暂不执行修改。" };
+  }
+  if (
+    (name === "create_tasks" || name === "update_task") &&
+    (turnState.onlyPlanDeletion || turnState.plannedDeletes.size > 0)
+  ) {
+    return { ok: false, error: "本轮正在确认删除目标，请另发消息修改或新增任务。" };
+  }
+  if (name === "delete_task" && turnState.mutations.length > 0) {
+    turnState.needsSeparateDeletion = true;
+    return { ok: false, error: "本轮已有其他操作保存，请另发消息指定要删除的任务。" };
+  }
   const parsedJson = parseJsonArgs(rawArgs);
-  if (!parsedJson.ok) return { ok: false, error: parsedJson.error };
+  if (!parsedJson.ok) {
+    if (name === "delete_task") turnState.invalidDelete = true;
+    return { ok: false, error: parsedJson.error };
+  }
   const input = parsedJson.data;
 
   if (name === "list_tasks") {
@@ -322,6 +346,7 @@ export function executeAgentTool(
       effort,
       query,
       limit = DEFAULT_LIST_LIMIT,
+      offset = 0,
     } = parsed.data;
     const allTasks = tasks.list();
     const titles = new Map(allTasks.map((item) => [item.id, item.title]));
@@ -345,7 +370,8 @@ export function executeAgentTool(
       return true;
     });
 
-    const sliced = filtered.slice(0, limit);
+    const sliced = filtered.slice(offset, offset + limit);
+    const nextOffset = offset + sliced.length;
     const tree = buildTaskTree(sliced, today).map(({ task, subtasks }) => ({
       ...serializeTask(task, today, titles, allTasks),
       children: subtasks.map((child) => serializeTask(child, today, titles, allTasks)),
@@ -357,7 +383,8 @@ export function executeAgentTool(
       totalInStore: allTasks.length,
       matchedCount: filtered.length,
       returnedCount: sliced.length,
-      truncated: filtered.length > sliced.length,
+      truncated: offset > 0 || nextOffset < filtered.length,
+      ...(nextOffset < filtered.length ? { nextOffset } : {}),
       summary: {
         pending: allTasks.filter((item) => !item.done).length,
         done: allTasks.filter((item) => item.done).length,
@@ -425,15 +452,18 @@ export function executeAgentTool(
       },
     }));
 
+    if (entries.length > 1 && !tasks.createMany) {
+      return { ok: false, error: "当前任务存储无法一次保存多条任务。" };
+    }
     const createdTasks = tasks.createMany
       ? tasks.createMany(entries)
-      : entries.map((entry) => tasks.create(entry.title, entry.options));
+      : [tasks.create(entries[0].title, entries[0].options)];
 
-    const updatedAll = tasks.list();
-    const titles = new Map(updatedAll.map((item) => [item.id, item.title]));
     for (const task of createdTasks) {
       turnState.mutations.push(`新增「${task.title}」`);
     }
+    const updatedAll = tasks.list();
+    const titles = new Map(updatedAll.map((item) => [item.id, item.title]));
 
     return {
       ok: true,
@@ -521,39 +551,23 @@ export function executeAgentTool(
 
   if (name === "delete_task") {
     const parsed = deleteTaskArgsSchema.safeParse(input);
-    if (!parsed.success) return { ok: false, error: "delete_task 需要提供精确 id。" };
+    if (!parsed.success) {
+      turnState.invalidDelete = true;
+      return { ok: false, error: "delete_task 需要提供精确 id。" };
+    }
 
-    const allTasks = tasks.list();
-    const existing = allTasks.find((item) => item.id === parsed.data.id);
+    const existing = tasks.list().find((item) => item.id === parsed.data.id);
     if (!existing) {
+      turnState.invalidDelete = true;
       return { ok: false, error: `找不到 id=${parsed.data.id} 的任务，请先调用 list_tasks 核对。` };
     }
 
-    // 服务端硬护栏：未经用户明确二次确认，禁止单轮删除 3 条及以上或清空多条清单。
-    const nextDeletedCount = turnState.deletedCount + 1;
-    const wouldClearMultiTaskList =
-      turnState.initialTaskCount >= 2 && allTasks.length === 1 && turnState.deletedCount >= 1;
-    if (!turnState.bulkDeleteConfirmed && (nextDeletedCount >= 3 || wouldClearMultiTaskList)) {
-      return {
-        ok: false,
-        requiresConfirmation: true,
-        error:
-          "服务端安全护栏：单轮删除 3 条及以上或清空全部任务前，必须先向用户列出待删除任务并获得明确确认。",
-      };
-    }
-
-    const detachedSubtasks = allTasks.filter((item) => item.parentId === existing.id).length;
-    if (!tasks.remove(existing.id)) {
-      return { ok: false, error: "删除失败，任务可能已不存在。" };
-    }
-
-    turnState.deletedCount = nextDeletedCount;
-    turnState.mutations.push(`删除「${existing.title}」`);
-
+    const planned = { id: existing.id, title: existing.title };
+    turnState.plannedDeletes.set(planned.id, planned);
     return {
       ok: true,
-      deleted: { id: existing.id, title: existing.title },
-      detachedSubtasks,
+      planned,
+      status: "planned",
     };
   }
 

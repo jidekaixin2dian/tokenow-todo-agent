@@ -1,5 +1,7 @@
 import {
+  useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -28,6 +30,17 @@ interface PendingLocalOp {
   done?: boolean;
 }
 
+interface LeavingTask {
+  task: Task;
+  childIds: string[];
+  index: number;
+}
+
+interface TaskPresence {
+  source: Task[] | null;
+  leaving: Map<string, LeavingTask>;
+}
+
 interface TaskPanelProps {
   revision: number;
   open: boolean;
@@ -49,24 +62,56 @@ function taskSignature(task: Task): string {
 
 function applyPendingOps(items: Task[], ops: Map<string, PendingLocalOp>): Task[] {
   if (ops.size === 0) return items;
-  const deletedIds = new Set<string>();
-  for (const [id, op] of ops) {
-    if (op.type === "delete") deletedIds.add(id);
+  return items.map((task) => {
+    const op = ops.get(task.id);
+    return op?.type === "toggle" && op.done !== undefined ? { ...task, done: op.done } : task;
+  });
+}
+
+function retainLeavingTasks(previous: TaskPresence, tasks: Task[] | null): TaskPresence {
+  const liveIds = new Set(tasks?.map((task) => task.id));
+  const leaving = new Map(previous.leaving);
+  for (const id of liveIds) leaving.delete(id);
+
+  const children = new Map<string, string[]>();
+  for (const task of previous.source ?? []) {
+    if (!task.parentId) continue;
+    const ids = children.get(task.parentId) ?? [];
+    ids.push(task.id);
+    children.set(task.parentId, ids);
   }
-  return items
-    .filter((item) => !deletedIds.has(item.id))
-    .map((item) => {
-      let next = item;
-      if (typeof next.parentId === "string" && deletedIds.has(next.parentId)) {
-        const copy = { ...next };
-        delete copy.parentId;
-        next = copy;
-      }
-      const op = ops.get(next.id);
-      if (op?.type === "toggle" && op.done !== undefined) {
-        return { ...next, done: op.done };
-      }
-      return next;
+  for (const [index, task] of (previous.source ?? []).entries()) {
+    if (!liveIds.has(task.id)) {
+      leaving.set(task.id, { task, childIds: children.get(task.id) ?? [], index });
+    }
+  }
+  return { source: tasks, leaving };
+}
+
+function rowsWithExits(tasks: Task[], leaving: Map<string, LeavingTask>): Task[] {
+  if (leaving.size === 0) return tasks;
+  const previousParents = new Map<string, string>();
+  for (const { task, childIds } of leaving.values()) {
+    for (const id of childIds) previousParents.set(id, task.id);
+  }
+  const rows = tasks.map((task) => {
+    const parentId = previousParents.get(task.id);
+    return parentId && !task.parentId ? { ...task, parentId } : task;
+  });
+  for (const { task, index } of [...leaving.values()].sort((a, b) => a.index - b.index)) {
+    rows.splice(index, 0, task);
+  }
+  return rows;
+}
+
+function removeAndDetach(tasks: Task[], id: string): Task[] {
+  return tasks
+    .filter((task) => task.id !== id)
+    .map((task) => {
+      if (task.parentId !== id) return task;
+      const detached = { ...task };
+      delete detached.parentId;
+      return detached;
     });
 }
 
@@ -77,21 +122,29 @@ export function TaskPanel({
   onPendingCountChange,
   onQuickPrompt,
 }: TaskPanelProps) {
-  const [tasks, setTasks] = useState<Task[] | null>(null);
-  const [error, setError] = useState(false);
+  const [snapshot, setSnapshot] = useState<Task[] | null>(null);
+  const [loadError, setLoadError] = useState(false);
+  const [actionError, setActionError] = useState("");
   const [attempt, setAttempt] = useState(0);
   const [filter, setFilter] = useState<FilterKey>("all");
-  const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set());
+  const [pendingOps, setPendingOps] = useState<Map<string, PendingLocalOp>>(() => new Map());
   const [flashedIds, setFlashedIds] = useState<Set<string>>(() => new Set());
   const [enteringIds, setEnteringIds] = useState<Set<string>>(() => new Set());
-  const [leavingIds, setLeavingIds] = useState<Set<string>>(() => new Set());
+  const [presence, setPresence] = useState<TaskPresence>(() => ({
+    source: null,
+    leaving: new Map(),
+  }));
 
   const previousSnapshot = useRef<Map<string, string> | null>(null);
-  const pendingOpsRef = useRef<Map<string, PendingLocalOp>>(new Map());
   const flashTimer = useRef<number | null>(null);
   const enterTimer = useRef<number | null>(null);
+  const exitTimers = useRef(new Map<string, number>());
   const loadVersion = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const previousRows = useRef<Map<string, number> | null>(null);
+  const focusedRow = useRef<{ id: string; button: HTMLElement } | null>(null);
+  const rowAnimations = useRef(new WeakMap<HTMLElement, Animation>());
+  const paintedDone = useRef(new Map<string, boolean>());
   const tabButtonsRef = useRef<Record<FilterKey, HTMLButtonElement | null>>({
     all: null,
     pending: null,
@@ -102,29 +155,147 @@ export function TaskPanel({
   // 窄屏打开抽屉时把焦点引入当前选中的筛选按钮，关闭时交由 App 还原焦点。
   const prevOpenRef = useRef(open);
   useEffect(() => {
+    let frame: number | undefined;
     if (isMobile && open && !prevOpenRef.current) {
-      requestAnimationFrame(() => tabButtonsRef.current[filter]?.focus());
+      frame = requestAnimationFrame(() => tabButtonsRef.current[filter]?.focus());
     }
     prevOpenRef.current = open;
+    return () => {
+      if (frame !== undefined) cancelAnimationFrame(frame);
+    };
   }, [isMobile, open, filter]);
 
-  // 纯副作用同步父组件待办计数和任务快照（严禁在 setTasks updater 内触发外部状态更新）。
+  const tasks = useMemo(
+    () => snapshot && applyPendingOps(snapshot, pendingOps),
+    [snapshot, pendingOps],
+  );
+  if (presence.source !== tasks) setPresence(retainLeavingTasks(presence, tasks));
+
   useEffect(() => {
-    if (!tasks) return;
-    previousSnapshot.current = new Map(tasks.map((item) => [item.id, taskSignature(item)]));
-    onPendingCountChange?.(tasks.filter((item) => !item.done).length);
+    if (tasks) onPendingCountChange?.(tasks.filter((item) => !item.done).length);
   }, [tasks, onPendingCountChange]);
+
+  const captureRows = useCallback(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && scroll.contains(active)) {
+      const id = active.closest<HTMLElement>("[data-task-id]")?.dataset.taskId;
+      if (id) focusedRow.current = { id, button: active };
+    }
+    if (scroll.closest(".is-resizing") || matchMedia("(prefers-reduced-motion: reduce)").matches)
+      return;
+    previousRows.current = new Map(
+      [...scroll.querySelectorAll<HTMLElement>(".task-node[data-task-id]")].map((row) => [
+        row.dataset.taskId!,
+        row.getBoundingClientRect().top,
+      ]),
+    );
+  }, []);
+
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const focus = focusedRow.current;
+    const positions = previousRows.current;
+    focusedRow.current = null;
+    previousRows.current = null;
+    if (
+      focus &&
+      (document.activeElement === document.body || document.activeElement === focus.button)
+    ) {
+      const row = [...scroll.querySelectorAll<HTMLElement>("[data-task-id]")].find(
+        (element) => element.dataset.taskId === focus.id && !element.closest("[inert]"),
+      );
+      const button = row?.querySelector<HTMLElement>(".task-check");
+      if (!button) tabButtonsRef.current[filter]?.focus();
+      else if (document.activeElement === document.body) button.focus({ preventScroll: true });
+    }
+    const before = paintedDone.current;
+    paintedDone.current = new Map(tasks?.map(({ id, done }) => [id, done]));
+    if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      for (const [id, done] of paintedDone.current) {
+        const wasDone = before.get(id);
+        if (wasDone === undefined || wasDone === done) continue;
+        const path = scroll.querySelector<SVGPathElement>(
+          `[data-task-id="${CSS.escape(id)}"] > div > .task-item > .task-check path`,
+        );
+        if (!path) continue;
+        const running = path.getAnimations()[0];
+        const from = running ? getComputedStyle(path).strokeDashoffset : wasDone ? "0px" : "18px";
+        running?.cancel();
+        path.animate([{ strokeDashoffset: from }, { strokeDashoffset: done ? "0px" : "18px" }], {
+          duration: 200,
+          easing: "cubic-bezier(.22,1,.36,1)",
+        });
+      }
+    }
+    if (!positions || scroll.closest(".is-resizing")) return;
+
+    const viewport = scroll.getBoundingClientRect();
+    const shifts: Array<{ row: HTMLElement; distance: number }> = [];
+    for (const row of scroll.querySelectorAll<HTMLElement>(
+      ".task-node[data-task-id]:not(.is-leaving)",
+    )) {
+      const previous = positions.get(row.dataset.taskId!);
+      if (previous === undefined) continue;
+      rowAnimations.current.get(row)?.cancel();
+      const rect = row.getBoundingClientRect();
+      const distance = previous - rect.top;
+      if (
+        Math.abs(distance) > 1 &&
+        rect.bottom + Math.max(0, distance) > viewport.top &&
+        rect.top + Math.min(0, distance) < viewport.bottom
+      ) {
+        shifts.push({ row, distance });
+      }
+    }
+    for (const { row, distance } of shifts) {
+      rowAnimations.current.set(
+        row,
+        row.animate([{ translate: `0 ${distance}px` }, { translate: "0 0" }], {
+          duration: 220,
+          easing: "cubic-bezier(.22,1,.36,1)",
+        }),
+      );
+    }
+  }, [tasks, filter]);
+
+  const finishExit = useCallback((id: string) => {
+    setPresence((current) => {
+      if (!current.leaving.has(id)) return current;
+      const leaving = new Map(current.leaving);
+      leaving.delete(id);
+      return { ...current, leaving };
+    });
+  }, []);
+
+  useEffect(() => {
+    const timers = exitTimers.current;
+    for (const [id, timer] of timers) {
+      if (!presence.leaving.has(id)) {
+        clearTimeout(timer);
+        timers.delete(id);
+      }
+    }
+    const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    for (const id of presence.leaving.keys()) {
+      if (!timers.has(id)) {
+        timers.set(
+          id,
+          window.setTimeout(() => finishExit(id), reduced ? 0 : 300),
+        );
+      }
+    }
+  }, [presence.leaving, finishExit]);
 
   useEffect(() => {
     const controller = new AbortController();
     const version = ++loadVersion.current;
     async function load() {
       try {
-        const rawItems = await fetchTasks(controller.signal);
+        const items = await fetchTasks(controller.signal);
         if (controller.signal.aborted || version !== loadVersion.current) return;
-
-        // 叠加尚未落盘的本地乐观操作，避免旧快照覆盖并发修改。
-        const items = applyPendingOps(rawItems, pendingOpsRef.current);
         const nextSnapshot = new Map(items.map((item) => [item.id, taskSignature(item)]));
 
         if (previousSnapshot.current) {
@@ -140,31 +311,36 @@ export function TaskPanel({
             }
           }
           if (changed.size > 0) {
-            setFlashedIds(changed);
+            setFlashedIds((ids) => new Set([...ids, ...changed]));
             if (flashTimer.current) window.clearTimeout(flashTimer.current);
             flashTimer.current = window.setTimeout(() => setFlashedIds(new Set()), 980);
           }
           if (added.size > 0) {
-            setEnteringIds(added);
+            setEnteringIds((ids) => new Set([...ids, ...added]));
             if (enterTimer.current) window.clearTimeout(enterTimer.current);
             enterTimer.current = window.setTimeout(() => setEnteringIds(new Set()), 280);
           }
         }
 
-        setTasks(items);
-        setError(false);
+        captureRows();
+        previousSnapshot.current = nextSnapshot;
+        setSnapshot(items);
+        setLoadError(false);
       } catch {
-        if (!controller.signal.aborted && version === loadVersion.current) setError(true);
+        if (!controller.signal.aborted && version === loadVersion.current) setLoadError(true);
       }
     }
     void load();
     return () => controller.abort();
-  }, [revision, attempt]);
+  }, [revision, attempt, captureRows]);
 
   useEffect(() => {
+    const timers = exitTimers.current;
     return () => {
       if (flashTimer.current) window.clearTimeout(flashTimer.current);
       if (enterTimer.current) window.clearTimeout(enterTimer.current);
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
     };
   }, []);
 
@@ -185,7 +361,10 @@ export function TaskPanel({
     return { total, pending, done, overdue, dueToday, progress };
   }, [tasks, today]);
 
-  const tree = useMemo(() => buildTaskTree(tasks ?? [], today), [tasks, today]);
+  const tree = useMemo(
+    () => buildTaskTree(rowsWithExits(tasks ?? [], presence.leaving), today),
+    [tasks, presence.leaving, today],
+  );
 
   const subtaskProgressByParent = useMemo(() => {
     const map = new Map<string, { label: string; complete: boolean }>();
@@ -202,7 +381,7 @@ export function TaskPanel({
   }, [tree]);
 
   const filteredTree = useMemo(() => {
-    if (filter === "all") return tree;
+    if (filter === "all") return tree.map((node) => ({ ...node, parentMatched: true }));
     return tree
       .map((node) => {
         const match = (item: Task) => {
@@ -212,12 +391,12 @@ export function TaskPanel({
           return !item.done && (due === "today" || due === "overdue");
         };
         const parentMatched = match(node.task);
-        const matchingSubtasks =
-          filter === "today" && parentMatched ? node.subtasks : node.subtasks.filter(match);
+        const matchingSubtasks = node.subtasks.filter(match);
         if (parentMatched || matchingSubtasks.length > 0) {
           return {
             task: node.task,
             subtasks: matchingSubtasks,
+            parentMatched,
           };
         }
         return null;
@@ -225,86 +404,57 @@ export function TaskPanel({
       .filter((node): node is NonNullable<typeof node> => node !== null);
   }, [tree, filter, today]);
 
-  async function handleToggle(task: Task) {
-    if (busyIds.has(task.id) || leavingIds.has(task.id)) return;
-    const previousDone = task.done;
-    const targetDone = !previousDone;
+  function rememberFocus(task: Task, button: HTMLButtonElement) {
+    if (document.activeElement === button) focusedRow.current = { id: task.id, button };
+  }
 
-    setBusyIds((prev) => new Set(prev).add(task.id));
-    pendingOpsRef.current.set(task.id, { type: "toggle", done: targetDone });
+  function finishOperation(id: string) {
+    // Any GET started before this mutation settled may carry an older snapshot.
+    loadVersion.current += 1;
+    setPendingOps((ops) => {
+      const next = new Map(ops);
+      next.delete(id);
+      return next;
+    });
+    setAttempt((count) => count + 1);
+  }
 
-    setTasks(
-      (prev) =>
-        prev?.map((item) => (item.id === task.id ? { ...item, done: targetDone } : item)) ?? null,
-    );
+  async function handleToggle(task: Task, button: HTMLButtonElement) {
+    if (pendingOps.has(task.id) || presence.leaving.has(task.id)) return;
+    const done = !task.done;
+    setActionError("");
+    rememberFocus(task, button);
+    captureRows();
+    setPendingOps((ops) => new Map(ops).set(task.id, { type: "toggle", done }));
 
     try {
-      const updated = await updateTaskDone(task.id, targetDone);
-      pendingOpsRef.current.delete(task.id);
-      setTasks((prev) => prev?.map((item) => (item.id === updated.id ? updated : item)) ?? null);
-    } catch {
-      pendingOpsRef.current.delete(task.id);
-      // 仅按当前任务 ID 精确回滚，绝不回滚其他并发任务状态。
-      setTasks(
-        (prev) =>
-          prev?.map((item) => (item.id === task.id ? { ...item, done: previousDone } : item)) ??
+      const updated = await updateTaskDone(task.id, done);
+      setSnapshot(
+        (items) =>
+          items?.map((item) => (item.id === updated.id ? { ...item, done: updated.done } : item)) ??
           null,
       );
-      setError(true);
+    } catch {
+      captureRows();
+      setActionError("更新任务状态失败，请核对清单后重试。");
     } finally {
-      setBusyIds((prev) => {
-        const next = new Set(prev);
-        next.delete(task.id);
-        return next;
-      });
+      finishOperation(task.id);
     }
   }
 
-  async function handleDelete(task: Task) {
-    if (busyIds.has(task.id) || leavingIds.has(task.id)) return;
-    setBusyIds((prev) => new Set(prev).add(task.id));
-    setLeavingIds((prev) => new Set(prev).add(task.id));
-    pendingOpsRef.current.set(task.id, { type: "delete" });
-
-    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const exitDelay = reduced ? 0 : 210;
+  async function handleDelete(task: Task, button: HTMLButtonElement) {
+    if (pendingOps.has(task.id) || presence.leaving.has(task.id)) return;
+    setActionError("");
+    setPendingOps((ops) => new Map(ops).set(task.id, { type: "delete" }));
 
     try {
-      await Promise.all([
-        removeTaskById(task.id),
-        new Promise((resolve) => window.setTimeout(resolve, exitDelay)),
-      ]);
-      pendingOpsRef.current.delete(task.id);
-      setTasks((prev) => {
-        if (!prev) return null;
-        return prev
-          .filter((item) => item.id !== task.id)
-          .map((item) => {
-            if (item.parentId !== task.id) return item;
-            const copy = { ...item };
-            delete copy.parentId;
-            return copy;
-          });
-      });
-      requestAnimationFrame(() => {
-        if (document.activeElement === document.body) {
-          scrollRef.current?.focus();
-        }
-      });
+      await removeTaskById(task.id);
+      rememberFocus(task, button);
+      setSnapshot((items) => items && removeAndDetach(items, task.id));
     } catch {
-      pendingOpsRef.current.delete(task.id);
-      setError(true);
+      setActionError("删除任务失败，请核对清单后重试。");
     } finally {
-      setLeavingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(task.id);
-        return next;
-      });
-      setBusyIds((prev) => {
-        const next = new Set(prev);
-        next.delete(task.id);
-        return next;
-      });
+      finishOperation(task.id);
     }
   }
 
@@ -353,7 +503,7 @@ export function TaskPanel({
     isSubtask: boolean,
     progress?: { label: string; complete: boolean },
   ) {
-    const isBusy = busyIds.has(task.id);
+    const isBusy = pendingOps.has(task.id);
     const isFlashed = flashedIds.has(task.id);
     const dueState = getTaskDueState(task, today);
     const itemClasses = [
@@ -367,14 +517,14 @@ export function TaskPanel({
       .join(" ");
 
     return (
-      <div className={itemClasses}>
+      <div className={itemClasses} aria-busy={isBusy || undefined}>
         <button
           type="button"
           className="task-check"
           aria-label={task.done ? `取消完成「${task.title}」` : `标记完成「${task.title}」`}
           aria-pressed={task.done}
-          disabled={isBusy}
-          onClick={() => void handleToggle(task)}
+          aria-disabled={isBusy || undefined}
+          onClick={(event) => void handleToggle(task, event.currentTarget)}
         >
           <span className="task-mark" aria-hidden="true">
             <svg viewBox="0 0 14 14" focusable="false">
@@ -402,7 +552,10 @@ export function TaskPanel({
               className="task-action-btn"
               title="在对话中继续修改此任务"
               aria-label={`在对话中操作「${task.title}」`}
-              onClick={() => onQuickPrompt(`把「${task.title}」的`)}
+              aria-disabled={isBusy || undefined}
+              onClick={() => {
+                if (!isBusy) onQuickPrompt(`把「${task.title}」的`);
+              }}
             >
               ✎
             </button>
@@ -412,8 +565,8 @@ export function TaskPanel({
             className="task-action-btn is-danger"
             title="删除任务"
             aria-label={`删除「${task.title}」`}
-            disabled={isBusy}
-            onClick={() => void handleDelete(task)}
+            aria-disabled={isBusy || undefined}
+            onClick={(event) => void handleDelete(task, event.currentTarget)}
           >
             ×
           </button>
@@ -422,32 +575,66 @@ export function TaskPanel({
     );
   }
 
-  function renderNode(task: Task, subtasks: Task[]) {
+  function renderNode(task: Task, subtasks: Task[], parentMatched: boolean) {
     const progress = subtaskProgressByParent.get(task.id);
+    const isLeaving = presence.leaving.has(task.id);
     const nodeClasses = [
       "task-node",
-      enteringIds.has(task.id) ? "is-entering" : "",
-      leavingIds.has(task.id) ? "is-leaving" : "",
+      enteringIds.has(task.id) && !isLeaving ? "is-entering" : "",
+      isLeaving ? "is-leaving" : "",
     ]
       .filter(Boolean)
       .join(" ");
 
     return (
-      <li key={task.id} className={nodeClasses}>
+      <li
+        key={`task:${task.id}`}
+        className={nodeClasses}
+        data-task-id={task.id}
+        inert={isLeaving}
+        onTransitionEnd={(event) => {
+          if (
+            isLeaving &&
+            event.target === event.currentTarget &&
+            event.propertyName === "grid-template-rows"
+          ) {
+            finishExit(task.id);
+          }
+        }}
+      >
         <div className="task-node-inner">
-          {renderTaskRow(task, false, progress)}
+          {parentMatched ? (
+            renderTaskRow(task, false, progress)
+          ) : (
+            <p className="task-context">主任务 · {task.title}</p>
+          )}
           {subtasks.length > 0 && (
             <ul className="subtask-list">
               {subtasks.map((child) => {
+                const childLeaving = presence.leaving.has(child.id);
                 const subClasses = [
                   "subtask-wrap",
-                  enteringIds.has(child.id) ? "is-entering" : "",
-                  leavingIds.has(child.id) ? "is-leaving" : "",
+                  enteringIds.has(child.id) && !childLeaving ? "is-entering" : "",
+                  childLeaving ? "is-leaving" : "",
                 ]
                   .filter(Boolean)
                   .join(" ");
                 return (
-                  <li key={child.id} className={subClasses}>
+                  <li
+                    key={child.id}
+                    className={subClasses}
+                    data-task-id={child.id}
+                    inert={childLeaving}
+                    onTransitionEnd={(event) => {
+                      if (
+                        childLeaving &&
+                        event.target === event.currentTarget &&
+                        event.propertyName === "grid-template-rows"
+                      ) {
+                        finishExit(child.id);
+                      }
+                    }}
+                  >
                     <div>{renderTaskRow(child, true)}</div>
                   </li>
                 );
@@ -473,13 +660,41 @@ export function TaskPanel({
   const doneNodes = filteredTree.filter(
     (node) => node.task.done && node.subtasks.every((child) => child.done),
   );
-  const pendingGroupPendingCount = pendingNodes.reduce(
-    (sum, node) => sum + (node.task.done ? 0 : 1) + node.subtasks.filter((c) => !c.done).length,
+  const doneGroupCount = doneNodes.reduce(
+    (sum, node) =>
+      sum + [node.task, ...node.subtasks].filter((task) => !presence.leaving.has(task.id)).length,
     0,
   );
-  const doneGroupCount = doneNodes.reduce((sum, node) => sum + 1 + node.subtasks.length, 0);
   const allCompleted = stats.total > 0 && stats.pending === 0;
   const isHiddenDrawer = isMobile && !open;
+  const error = actionError || (loadError ? "同步清单失败，请稍后重试" : "");
+  const visibleNodes =
+    filter === "all"
+      ? [
+          ...(pendingNodes.length
+            ? [
+                <li key="pending-heading" className="task-group-heading" role="presentation">
+                  <h3>
+                    待办 <AnimatedNumber value={stats.pending} />
+                  </h3>
+                </li>,
+                ...pendingNodes.map(({ task, subtasks }) => renderNode(task, subtasks, true)),
+              ]
+            : []),
+          ...(doneNodes.length
+            ? [
+                <li key="done-heading" className="task-group-heading" role="presentation">
+                  <h3>
+                    已完成 <AnimatedNumber value={doneGroupCount} />
+                  </h3>
+                </li>,
+                ...doneNodes.map(({ task, subtasks }) => renderNode(task, subtasks, true)),
+              ]
+            : []),
+        ]
+      : filteredTree.map(({ task, subtasks, parentMatched }) =>
+          renderNode(task, subtasks, parentMatched),
+        );
 
   return (
     <div
@@ -491,20 +706,27 @@ export function TaskPanel({
         <div className="task-panel-header">
           <div className="task-heading-row">
             <h2 id="task-panel-title">任务清单</h2>
-            {stats.total > 0 && (
-              <span className="task-ratio" aria-label={`已完成 ${stats.done} / ${stats.total}`}>
-                <AnimatedNumber value={stats.done} />/<AnimatedNumber value={stats.total} />
-              </span>
-            )}
+            <span
+              className={stats.total > 0 ? "task-ratio" : "task-ratio is-empty"}
+              aria-hidden="true"
+            >
+              <AnimatedNumber value={stats.done} />/<AnimatedNumber value={stats.total} />
+            </span>
           </div>
-          {stats.total > 0 && (
-            <div className="task-progress-bar" aria-hidden="true">
-              <div
-                className={allCompleted ? "task-progress-fill is-complete" : "task-progress-fill"}
-                style={{ width: `${stats.progress}%` }}
-              />
-            </div>
-          )}
+          <div
+            className={stats.total > 0 ? "task-progress-bar" : "task-progress-bar is-empty"}
+            role={stats.total > 0 ? "progressbar" : undefined}
+            aria-label={stats.total > 0 ? "任务完成进度" : undefined}
+            aria-valuetext={
+              stats.total > 0 ? `已完成 ${stats.done} 项，共 ${stats.total} 项` : undefined
+            }
+            aria-valuenow={stats.total > 0 ? stats.progress : undefined}
+          >
+            <div
+              className={allCompleted ? "task-progress-fill is-complete" : "task-progress-fill"}
+              style={{ transform: `scaleX(${stats.progress / 100})` }}
+            />
+          </div>
           {(stats.overdue > 0 || stats.dueToday > 0) && (
             <div className="task-alerts">
               {stats.overdue > 0 && (
@@ -561,11 +783,12 @@ export function TaskPanel({
         >
           {error && (
             <div className="task-load-error">
-              <p role="status">同步清单失败，请稍后重试</p>
+              <p role="status">{error}</p>
               <button
                 type="button"
                 onClick={() => {
-                  setError(false);
+                  setActionError("");
+                  setLoadError(false);
                   setAttempt((count) => count + 1);
                 }}
               >
@@ -580,14 +803,14 @@ export function TaskPanel({
             </p>
           )}
 
-          {tasks?.length === 0 && !error && (
+          {tasks?.length === 0 && visibleNodes.length === 0 && !error && (
             <div className="task-empty-card">
               <p className="task-empty">清单还是空的</p>
               <small>在左侧对小明说「帮我记一下买牛奶」，任务就会实时同步到这里。</small>
             </div>
           )}
 
-          {!!tasks?.length && filteredTree.length === 0 && (
+          {!!tasks?.length && visibleNodes.length === 0 && (
             <div
               className={
                 filter === "pending" && allCompleted
@@ -608,47 +831,7 @@ export function TaskPanel({
             </div>
           )}
 
-          {!!tasks?.length && filteredTree.length > 0 && (
-            <>
-              {filter === "all" ? (
-                <>
-                  {pendingNodes.length > 0 && (
-                    <section className="task-group" aria-labelledby="task-group-pending">
-                      <h3 id="task-group-pending">
-                        待办{" "}
-                        <span>
-                          <AnimatedNumber value={pendingGroupPendingCount} />
-                        </span>
-                      </h3>
-                      <ul className="task-items">
-                        {pendingNodes.map(({ task, subtasks }) => renderNode(task, subtasks))}
-                      </ul>
-                    </section>
-                  )}
-
-                  {doneNodes.length > 0 && (
-                    <section className="task-group" aria-labelledby="task-group-done">
-                      <h3 id="task-group-done">
-                        已完成{" "}
-                        <span>
-                          <AnimatedNumber value={doneGroupCount} />
-                        </span>
-                      </h3>
-                      <ul className="task-items">
-                        {doneNodes.map(({ task, subtasks }) => renderNode(task, subtasks))}
-                      </ul>
-                    </section>
-                  )}
-                </>
-              ) : (
-                <section className="task-group">
-                  <ul className="task-items">
-                    {filteredTree.map(({ task, subtasks }) => renderNode(task, subtasks))}
-                  </ul>
-                </section>
-              )}
-            </>
-          )}
+          {visibleNodes.length > 0 && <ul className="task-items">{visibleNodes}</ul>}
         </div>
       </aside>
     </div>

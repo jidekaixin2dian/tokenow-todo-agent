@@ -16,6 +16,7 @@ export interface TaskStore {
   createMany?(entries: Array<{ title: string; options?: TaskOptions }>): Task[];
   update(id: string, changes: TaskChanges): Task | undefined;
   remove(id: string): boolean;
+  removeMany?(ids: string[]): boolean;
 }
 
 function cleanOptions(options?: TaskOptions): Partial<Task> {
@@ -40,6 +41,21 @@ export function createJsonTaskStore(filename: string): TaskStore {
     const temporary = filename + ".tmp";
     writeFileSync(temporary, JSON.stringify(tasks, null, 2) + "\n");
     renameSync(temporary, filename);
+  }
+
+  function removeMany(ids: string[]): boolean {
+    if (ids.length === 0) return false;
+    const tasks = list();
+    const knownIds = new Set(tasks.map((task) => task.id));
+    if (ids.some((id) => !knownIds.has(id))) return false;
+
+    const removedIds = new Set(ids);
+    const remaining = tasks.filter((task) => !removedIds.has(task.id));
+    for (const task of remaining) {
+      if (task.parentId && removedIds.has(task.parentId)) delete task.parentId;
+    }
+    save(remaining);
+    return true;
   }
 
   return {
@@ -81,15 +97,8 @@ export function createJsonTaskStore(filename: string): TaskStore {
     },
 
     remove(id) {
-      const tasks = list();
-      const remaining = tasks.filter((task) => task.id !== id);
-      if (remaining.length === tasks.length) return false;
-
-      for (const task of remaining) {
-        if (task.parentId === id) delete task.parentId;
-      }
-      save(remaining);
-      return true;
+      return removeMany([id]);
     },
+    removeMany,
   };
 }

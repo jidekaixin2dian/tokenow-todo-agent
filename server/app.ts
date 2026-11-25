@@ -10,7 +10,7 @@ export interface AppStatus {
 }
 
 interface AppDependencies {
-  reply(messages: ChatMessage[]): Promise<string>;
+  reply(messages: ChatMessage[], conversationId?: string): Promise<string>;
   tasks: TaskStore;
   status?: AppStatus;
 }
@@ -32,7 +32,7 @@ export function createApp({
     if (!input.success) {
       return res.status(400).json({ error: "请提供对话记录，并以用户消息结尾。" });
     }
-    const answer = await reply(input.data.messages);
+    const answer = await reply(input.data.messages, input.data.conversationId);
     res.json({ reply: answer });
   });
 

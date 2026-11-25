@@ -9,7 +9,12 @@ import {
 } from "react";
 import type { ChatMessage } from "../shared/chat.ts";
 import { AnimatedNumber } from "./AnimatedNumber.tsx";
-import { fetchAppStatus, requestReply, type AppStatusInfo } from "./chat-client.ts";
+import {
+  fetchAppStatus,
+  newConversationId,
+  requestReply,
+  type AppStatusInfo,
+} from "./chat-client.ts";
 import { ChatHistory } from "./ChatHistory.tsx";
 import { TaskPanel } from "./TaskPanel.tsx";
 
@@ -36,17 +41,18 @@ function readIsMobile(): boolean {
   return window.matchMedia(MOBILE_QUERY).matches;
 }
 
+function maxPanelWidth(): number {
+  if (typeof window === "undefined") return MAX_PANEL_WIDTH;
+  return Math.max(MIN_PANEL_WIDTH, Math.min(MAX_PANEL_WIDTH, Math.round(window.innerWidth * 0.52)));
+}
+
 function clampPanelWidth(width: number): number {
-  if (typeof window === "undefined") return width;
-  const maxAllowed = Math.max(
-    MIN_PANEL_WIDTH,
-    Math.min(MAX_PANEL_WIDTH, Math.round(window.innerWidth * 0.52)),
-  );
-  return Math.max(MIN_PANEL_WIDTH, Math.min(maxAllowed, width));
+  return Math.max(MIN_PANEL_WIDTH, Math.min(maxPanelWidth(), width));
 }
 
 export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [conversationId, setConversationId] = useState(newConversationId);
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
@@ -57,18 +63,35 @@ export default function App() {
   const [pendingCount, setPendingCount] = useState(0);
   const [status, setStatus] = useState<AppStatusInfo | null>(null);
   const [theme, setTheme] = useState<Theme>(readInitialTheme);
-  const [panelWidth, setPanelWidth] = useState(DEFAULT_PANEL_WIDTH);
+  const [panelWidth, setPanelWidth] = useState(() => clampPanelWidth(DEFAULT_PANEL_WIDTH));
+  const [panelMaximum, setPanelMaximum] = useState(maxPanelWidth);
   const [resizing, setResizing] = useState(false);
 
+  const appRef = useRef<HTMLDivElement>(null);
+  const composeRef = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const toggleBtnRef = useRef<HTMLButtonElement>(null);
   const themeTimerRef = useRef<number | null>(null);
+  const manualThemeRef = useRef(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
 
   // 同步展示中的错误文本（收起时保留文本直至过渡完成再清空，避免文字先蒸发）
   useEffect(() => {
     if (error) setRenderedError(error);
   }, [error]);
+
+  useEffect(() => {
+    const compose = composeRef.current;
+    if (!compose || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => {
+      appRef.current?.style.setProperty(
+        "--compose-height",
+        `${entry.target.getBoundingClientRect().height}px`,
+      );
+    });
+    observer.observe(compose, { box: "border-box" });
+    return () => observer.disconnect();
+  }, []);
 
   const applyTheme = useCallback((next: Theme, options: { animate: boolean; persist: boolean }) => {
     const root = document.documentElement;
@@ -113,8 +136,10 @@ export default function App() {
     function onMediaChange(event: MediaQueryListEvent) {
       setIsMobile(event.matches);
       if (!event.matches) setShowTasks(false);
+      else dragCleanupRef.current?.();
     }
     function onWindowResize() {
+      setPanelMaximum(maxPanelWidth());
       setPanelWidth((current) => clampPanelWidth(current));
     }
     media.addEventListener("change", onMediaChange);
@@ -129,8 +154,10 @@ export default function App() {
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     function onChange(event: MediaQueryListEvent) {
+      if (manualThemeRef.current) return;
       try {
-        if (localStorage.getItem("tokenow-theme")) return;
+        const saved = localStorage.getItem("tokenow-theme");
+        if (saved === "light" || saved === "dark") return;
       } catch {
         // 存储不可用时继续跟随系统
       }
@@ -144,7 +171,21 @@ export default function App() {
 
   const closeMobileDrawer = useCallback(() => {
     setShowTasks(false);
-    requestAnimationFrame(() => toggleBtnRef.current?.focus());
+    requestAnimationFrame(() => {
+      const toggle = toggleBtnRef.current;
+      const active = document.activeElement;
+      if (
+        toggle?.getAttribute("aria-expanded") === "false" &&
+        (active === document.body || active?.closest(".task-panel-shell"))
+      ) {
+        toggle.focus();
+      }
+    });
+  }, []);
+
+  const dismissError = useCallback(() => {
+    if (document.activeElement?.closest(".error-collapse")) input.current?.focus();
+    setError("");
   }, []);
 
   // 全局轻量快捷键：/ 聚焦输入，Esc 关闭移动端抽屉或错误提示
@@ -154,7 +195,7 @@ export default function App() {
         if (isMobile && showTasks) {
           closeMobileDrawer();
         } else if (error) {
-          setError("");
+          dismissError();
         }
         return;
       }
@@ -172,14 +213,13 @@ export default function App() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isMobile, showTasks, error, closeMobileDrawer]);
+  }, [isMobile, showTasks, error, closeMobileDrawer, dismissError]);
 
   const handleToggleTheme = useCallback(() => {
-    setTheme((current) => {
-      const next: Theme = current === "dark" ? "light" : "dark";
-      applyTheme(next, { animate: true, persist: true });
-      return next;
-    });
+    const next: Theme = readInitialTheme() === "dark" ? "light" : "dark";
+    manualThemeRef.current = true;
+    setTheme(next);
+    applyTheme(next, { animate: true, persist: true });
   }, [applyTheme]);
 
   const handleResizeStart = useCallback(
@@ -192,6 +232,8 @@ export default function App() {
       const pointerId = event.pointerId;
       const startX = event.clientX;
       const startWidth = panelWidth;
+      let frame: number | null = null;
+      let lastWidth: number | undefined;
 
       try {
         target.setPointerCapture(pointerId);
@@ -202,20 +244,29 @@ export default function App() {
 
       function onMove(moveEvent: globalThis.PointerEvent) {
         if (moveEvent.pointerId !== pointerId) return;
-        const delta = startX - moveEvent.clientX;
-        setPanelWidth(clampPanelWidth(startWidth + delta));
+        lastWidth = startWidth + startX - moveEvent.clientX;
+        frame ??= requestAnimationFrame(() => {
+          frame = null;
+          if (lastWidth !== undefined) setPanelWidth(clampPanelWidth(lastWidth));
+        });
       }
 
       function cleanup() {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onEnd);
+        window.removeEventListener("pointercancel", onEnd);
+        window.removeEventListener("blur", cleanup);
+        target.removeEventListener("lostpointercapture", onEnd);
+        if (frame !== null) {
+          cancelAnimationFrame(frame);
+          if (lastWidth !== undefined) setPanelWidth(clampPanelWidth(lastWidth));
+        }
         setResizing(false);
         try {
           if (target.hasPointerCapture(pointerId)) {
             target.releasePointerCapture(pointerId);
           }
         } catch {}
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onEnd);
-        window.removeEventListener("pointercancel", onEnd);
         dragCleanupRef.current = null;
       }
 
@@ -228,6 +279,8 @@ export default function App() {
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onEnd);
       window.addEventListener("pointercancel", onEnd);
+      window.addEventListener("blur", cleanup);
+      target.addEventListener("lostpointercapture", onEnd);
     },
     [panelWidth],
   );
@@ -277,14 +330,14 @@ export default function App() {
     setPending(true);
     setError("");
     try {
-      const answer = await requestReply(outgoing);
+      const answer = await requestReply(outgoing, conversationId);
       setMessages([...outgoing, { role: "assistant", content: answer }]);
-      setTaskRevision((revision) => revision + 1);
     } catch (cause) {
       setMessages(messages);
       setDraft(text);
       setError(cause instanceof Error ? `发送失败：${cause.message}` : "发送失败，请稍后重试。");
     } finally {
+      setTaskRevision((revision) => revision + 1);
       setPending(false);
       requestAnimationFrame(() => {
         const field = input.current;
@@ -298,6 +351,7 @@ export default function App() {
 
   return (
     <div
+      ref={appRef}
       className={resizing ? "app is-resizing" : "app"}
       style={{ "--panel-width": `${panelWidth}px` } as CSSProperties}
     >
@@ -328,6 +382,7 @@ export default function App() {
               disabled={pending}
               onClick={() => {
                 setMessages([]);
+                setConversationId(newConversationId());
                 setError("");
                 input.current?.focus();
               }}
@@ -375,11 +430,12 @@ export default function App() {
             }}
           >
             任务清单
-            {pendingCount > 0 && (
-              <em className="toggle-badge">
-                <AnimatedNumber value={pendingCount} compact />
-              </em>
-            )}
+            <em
+              className={pendingCount > 0 ? "toggle-badge is-visible" : "toggle-badge"}
+              aria-hidden={pendingCount === 0 || undefined}
+            >
+              <AnimatedNumber value={pendingCount} compact />
+            </em>
           </button>
         </div>
       </header>
@@ -391,11 +447,16 @@ export default function App() {
             taskPanelOpen={showTasks}
             onSelectPrompt={send}
           />
-          <div className="compose">
+          <div className="compose" ref={composeRef}>
             <div
               className={error ? "error-collapse is-visible" : "error-collapse"}
+              inert={!error}
               onTransitionEnd={(event) => {
-                if (event.target === event.currentTarget && !error) {
+                if (
+                  event.target === event.currentTarget &&
+                  event.propertyName === "grid-template-rows" &&
+                  !error
+                ) {
                   setRenderedError("");
                 }
               }}
@@ -408,7 +469,7 @@ export default function App() {
                       type="button"
                       className="error-dismiss"
                       aria-label="关闭错误提示"
-                      onClick={() => setError("")}
+                      onClick={dismissError}
                     >
                       ×
                     </button>
@@ -454,8 +515,9 @@ export default function App() {
           tabIndex={0}
           aria-orientation="vertical"
           aria-valuemin={MIN_PANEL_WIDTH}
-          aria-valuemax={MAX_PANEL_WIDTH}
+          aria-valuemax={panelMaximum}
           aria-valuenow={panelWidth}
+          aria-controls="task-panel"
           aria-label="拖动或用左右方向键调整任务清单宽度，双击或按回车恢复默认"
           title="拖动调整宽度，双击恢复默认"
           onPointerDown={handleResizeStart}

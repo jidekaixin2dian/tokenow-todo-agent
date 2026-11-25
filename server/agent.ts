@@ -44,31 +44,36 @@ function isInquiry(content: string) {
 }
 
 export function createAgent(tasks: TaskStore, runner?: AgentRunner, clock = () => new Date()) {
-  return async (messages: ChatMessage[]): Promise<string> => {
+  return async (messages: ChatMessage[], conversationId?: string): Promise<string> => {
     const content = messages.at(-1)?.content;
     if (!content) return help;
     if (content.length > 2000) return "这条消息有点长，请简洁告诉我你要处理的任务。";
 
     const now = clock();
+    const intent = readLocalIntent(content, now);
+    const inquiry = isInquiry(content);
 
     // 配置了 DeepSeek 时，由真正的 Tool Calling 智能体主驱动全部对话。
     if (runner) {
       try {
-        return await runner(messages, tasks, now);
+        const allowWrites =
+          !inquiry &&
+          intent?.action !== "list" &&
+          !(intent?.action === "clarify" && intent.reason === "cancelled");
+        return await runner(messages, tasks, now, { conversationId, allowWrites });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`DeepSeek 调用失败：${message}`);
-        return "暂时无法连接 DeepSeek 服务，当前清单未发生变化，请检查网络、API Key 或稍后重试。";
+        return "暂时无法连接 DeepSeek 服务，请检查网络、API Key 或稍后重试。";
       }
     }
 
     // 未配置 Key 时，走离线规则降级模式。
     const today = localDate(now);
-    const intent = readLocalIntent(content, now);
     if (!intent) return help;
 
     // 针对原始未去标点文本执行问句拦截，防止「删除第2条？」这类问句误触发写入。
-    if (intent.action !== "list" && intent.action !== "clarify" && isInquiry(content)) {
+    if (intent.action !== "list" && intent.action !== "clarify" && inquiry) {
       return "如果要修改清单，请直接告诉我要做什么，例如「完成买牛奶」。";
     }
 

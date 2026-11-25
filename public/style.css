@@ -39,6 +39,8 @@
   --brand-soft: #eaf0ff;
   --brand-ring: rgba(22, 67, 231, 0.16);
   --brand-text: #1540d6;
+  --badge-bg: var(--brand);
+  --checkmark: #fff;
 
   --success: #16a34a;
   --success-soft: #e9f9ef;
@@ -94,6 +96,8 @@
   --brand-soft: rgba(59, 110, 255, 0.18);
   --brand-ring: rgba(83, 128, 255, 0.28);
   --brand-text: #8eb2ff;
+  --badge-bg: #2c55dc;
+  --checkmark: #0f141e;
 
   --success: #22c55e;
   --success-soft: rgba(34, 197, 94, 0.15);
@@ -126,9 +130,7 @@
 html.theme-animating,
 html.theme-animating body,
 html.theme-animating header,
-html.theme-animating .bubble,
-html.theme-animating .task-item,
-html.theme-animating form {
+html.theme-animating .bubble {
   transition:
     background-color var(--dur-state) var(--ease-standard),
     border-color var(--dur-state) var(--ease-standard),
@@ -170,7 +172,6 @@ button:focus-visible {
   flex-direction: column;
   height: 100dvh;
   overflow: hidden;
-  background: var(--bg-canvas);
 }
 
 .app.is-resizing {
@@ -341,14 +342,25 @@ header .brand-sub {
   font-style: normal;
   font-size: 11px;
   font-weight: 600;
-  min-width: 18px;
+  min-width: 23px;
   height: 18px;
   padding: 0 5px;
   border-radius: 999px;
   display: inline-grid;
   place-items: center;
-  background: var(--brand);
+  background: var(--badge-bg);
   color: #ffffff;
+  opacity: 0;
+  transform: scale(0.82);
+  transition:
+    opacity var(--dur-state) var(--ease-standard),
+    transform var(--dur-state) var(--ease-spring-out),
+    background-color var(--dur-state) var(--ease-standard);
+}
+
+.toggle-badge.is-visible {
+  opacity: 1;
+  transform: scale(1);
 }
 
 /* Workspace & Resizer */
@@ -718,6 +730,7 @@ form {
   background: var(--bg-surface);
   box-shadow: var(--shadow-sm);
   transition:
+    background-color var(--dur-state) var(--ease-standard),
     border-color var(--dur-state) var(--ease-standard),
     box-shadow var(--dur-state) var(--ease-standard);
 }
@@ -807,15 +820,9 @@ textarea::placeholder {
 /* Animated Number */
 .num-roll {
   display: inline-block;
+  min-inline-size: 2ch;
+  text-align: center;
   font-variant-numeric: tabular-nums;
-}
-
-.num-roll.is-up {
-  animation: num-up 180ms var(--ease-spring-out);
-}
-
-.num-roll.is-down {
-  animation: num-down 180ms var(--ease-spring-out);
 }
 
 /* Right Task Panel (Desktop side column + Mobile animated drawer) */
@@ -832,6 +839,9 @@ textarea::placeholder {
   flex-direction: column;
   background: var(--bg-surface);
   border-left: 1px solid var(--border-subtle);
+  transition:
+    background-color var(--dur-state) var(--ease-standard),
+    border-color var(--dur-state) var(--ease-standard);
 }
 
 .task-panel-header {
@@ -858,6 +868,12 @@ textarea::placeholder {
   font-weight: 600;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+  transition: opacity var(--dur-state) var(--ease-standard);
+}
+
+.task-ratio.is-empty,
+.task-progress-bar.is-empty {
+  opacity: 0;
 }
 
 .task-progress-bar {
@@ -866,15 +882,15 @@ textarea::placeholder {
   border-radius: 999px;
   background: var(--bg-segment);
   overflow: hidden;
+  transition: opacity var(--dur-state) var(--ease-standard);
 }
 
 .task-progress-fill {
   height: 100%;
   border-radius: 999px;
   background: linear-gradient(90deg, var(--brand) 0%, #4e80ff 100%);
-  transition:
-    width 380ms var(--ease-spring-out),
-    background 280ms var(--ease-standard);
+  transform-origin: left center;
+  transition: transform 320ms var(--ease-spring-out);
 }
 
 .task-progress-fill.is-complete {
@@ -938,14 +954,14 @@ textarea::placeholder {
   border: 0;
   background: transparent;
   border-radius: 8px;
-  padding: 6px 4px;
-  font-size: 12px;
+  padding: 6px 2px;
+  font-size: 11.5px;
   font-weight: 500;
   color: var(--text-muted);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: 3px;
   transition:
     color var(--dur-state) var(--ease-standard),
     transform var(--dur-press) var(--ease-spring-snappy);
@@ -955,9 +971,9 @@ textarea::placeholder {
   transform: scale(0.96);
 }
 
-.filter-tab span {
+.filter-tab > span {
   font-size: 11px;
-  opacity: 0.78;
+  color: var(--text-secondary);
 }
 
 .filter-tab.is-active {
@@ -1018,11 +1034,11 @@ textarea::placeholder {
   color: var(--danger-text);
 }
 
-.task-group + .task-group {
+.task-group-heading:not(:first-child) {
   margin-top: 20px;
 }
 
-.task-group h3 {
+.task-group-heading h3 {
   display: flex;
   align-items: baseline;
   gap: 7px;
@@ -1033,9 +1049,16 @@ textarea::placeholder {
   letter-spacing: 0.01em;
 }
 
-.task-group h3 span {
+.task-group-heading h3 span {
   font-weight: 500;
   color: var(--text-muted);
+}
+
+.task-context {
+  padding: 6px 10px;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
 }
 
 .task-items,
@@ -1111,6 +1134,10 @@ textarea::placeholder {
     transform var(--dur-state) var(--ease-spring-out);
 }
 
+.task-item [aria-disabled="true"] {
+  cursor: progress;
+}
+
 .task-item:hover {
   border-color: var(--border-default);
   box-shadow: var(--shadow-sm);
@@ -1169,13 +1196,12 @@ textarea::placeholder {
 
 .task-mark path {
   fill: none;
-  stroke: #ffffff;
+  stroke: var(--checkmark);
   stroke-width: 2.3;
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-dasharray: 18;
   stroke-dashoffset: 18;
-  transition: stroke-dashoffset 200ms var(--ease-spring-out);
 }
 
 .is-done .task-mark {
@@ -1455,28 +1481,6 @@ textarea::placeholder {
   }
 }
 
-@keyframes num-up {
-  from {
-    opacity: 0.25;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes num-down {
-  from {
-    opacity: 0.25;
-    transform: translateY(-4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -1525,12 +1529,18 @@ textarea::placeholder {
 
   .task-panel {
     overflow: hidden;
-    max-height: min(46dvh, calc(100dvh - 180px));
+    max-height: min(
+      46dvh,
+      max(0px, calc(100dvh - var(--drawer-reserved-height, 96px) - var(--compose-height, 125px)))
+    );
     border-left: 0;
     border-bottom: 1px solid var(--border-default);
     box-shadow: var(--shadow-md);
     transform: translateY(-6px);
-    transition: transform var(--dur-layout) var(--ease-spring-out);
+    transition:
+      transform var(--dur-layout) var(--ease-spring-out),
+      background-color var(--dur-state) var(--ease-standard),
+      border-color var(--dur-state) var(--ease-standard);
     position: relative;
   }
 
@@ -1554,13 +1564,66 @@ textarea::placeholder {
   }
 
   .task-scroll {
-    min-height: 112px;
+    min-height: 0;
     padding: 10px 16px 24px;
   }
 
   .task-actions {
     opacity: 1;
     transform: none;
+  }
+}
+
+@media (max-width: 820px) and (max-height: 520px) {
+  .task-panel {
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+
+  .task-panel::after {
+    content: none;
+  }
+
+  .task-scroll {
+    flex: 0 0 auto;
+    overflow: visible;
+  }
+}
+
+@media (max-width: 820px) and (max-height: 280px) {
+  .task-panel {
+    --drawer-reserved-height: 60px;
+  }
+}
+
+@media (max-width: 360px) {
+  header {
+    padding-inline: 10px;
+    gap: 6px;
+  }
+
+  header img {
+    width: 26px;
+    height: 26px;
+  }
+
+  header strong {
+    font-size: 16px;
+  }
+
+  .header-right {
+    gap: 5px;
+  }
+
+  .clear-chat,
+  .task-toggle {
+    padding-inline: 7px;
+    white-space: nowrap;
+  }
+
+  .toggle-badge {
+    min-width: 21px;
+    padding-inline: 3px;
   }
 }
 

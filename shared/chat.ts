@@ -8,6 +8,7 @@ const messageSchema = z.object({
 export type ChatMessage = z.infer<typeof messageSchema>;
 
 export const chatRequestSchema = z.object({
+  conversationId: z.uuid().optional(),
   messages: z
     .array(messageSchema)
     .min(1)

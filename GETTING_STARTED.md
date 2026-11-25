@@ -17,9 +17,11 @@ npm run dev
 
 1. 在项目根目录将 `.env.example` 复制为 `.env`。
 2. 在 `.env` 中填写 [DeepSeek 开放平台](https://platform.deepseek.com/) 的 API Key。默认使用 `deepseek-flash`，可通过 `DEEPSEEK_MODEL` 切换其他兼容模型，通过 `DEEPSEEK_REASONING_EFFORT`（`none` / `low` / `medium` / `high` / `max`）调整思考强度。
-3. 重启服务。服务端在 `server/model.ts` 中通过 `getModelClient()` 与 `createDeepSeekAgentRunner()` 发起标准 OpenAI 兼容的 Function Calling 多轮工具调用；启用后会向 DeepSeek 发送最近最多 16 条对话消息以及工具查询命中的任务片段（默认上限 50 条）。
+3. 重启服务。DeepSeek 模式会发送最近最多 16 条对话消息以及其中的工具调用和结果。清单查询每页默认 50 条，日程总览每组最多 20 条。`deepseek-chat` 和 `deepseek-reasoner` 旧配置会转到 `deepseek-flash`，分别默认关闭和开启思考。
 
 未配置 `DEEPSEEK_API_KEY` 时，服务完全运行在本地离线规则模式，不向外部发送任何对话或任务数据。
+
+网页会为每个对话生成一个 `conversationId`。服务端用它续接模型工具上下文和待确认的删除计划。直接调用 `POST /api/chat` 时仍可传 `{ messages }`，响应仍为 `{ reply }`。需要续接完整工具上下文或确认批量删除时，在同一对话的请求里带上同一个 UUID 格式的 `conversationId`。
 
 ## 代码入口
 

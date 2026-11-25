@@ -166,30 +166,16 @@ function readCreation(content: string, now: Date, parent?: string): Intent {
   const trimmed = content.trim();
   if (!trimmed) return { action: "clarify", reason: "title" };
 
-  // 支持明确批量分隔（、/以及），用「和」连接时仅当每一项都像独立待办动作才拆分，避免误拆「复习概率和统计」。
+  // 只有每段都能独立成待办时才拆分，保留「整理语文、数学笔记」这类共享动词的标题。
   const hasQuote = /[「『“"]/u.test(trimmed);
   const hasAttr = /(?:优先级|工作量|截止|到期)/u.test(trimmed);
-  if (!parent && !hasQuote && !hasAttr) {
-    let segments: string[] | null = null;
-    if (/(?:、|以及)/u.test(trimmed)) {
-      segments = trimmed
-        .split(/\s*(?:、|以及)\s*/u)
-        .map((s) => s.trim())
-        .filter(Boolean);
-    } else if (/和/u.test(trimmed)) {
-      const candidate = trimmed
-        .split(/\s*和\s*/u)
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (
-        candidate.length >= 2 &&
-        candidate.every((part) => actionVerbStart.test(part) && [...part].length >= 2)
-      ) {
-        segments = candidate;
-      }
-    }
-
-    if (segments && segments.length >= 2 && segments.length <= 10) {
+  if (!parent && !hasQuote && !hasAttr && /(?:、|以及|和)/u.test(trimmed)) {
+    const segments = trimmed.split(/\s*(?:、|以及|和)\s*/u);
+    if (
+      segments.length >= 2 &&
+      segments.length <= 10 &&
+      segments.every((part) => actionVerbStart.test(part) && [...part].length >= 2)
+    ) {
       const items = [];
       for (const segment of segments) {
         const parsed = readSingleCreation(segment, now);
