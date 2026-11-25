@@ -1,15 +1,19 @@
 import { Router } from "express";
 import { z } from "zod";
-import { taskDetailsFields, taskTitle } from "./task-schema.ts";
+import { taskDetailsFields, taskDetailsUpdateFields, taskTitle } from "./task-schema.ts";
 import type { TaskStore } from "./task-store.ts";
 
 const createTaskSchema = z.strictObject({
   title: taskTitle,
-  parentId: z.string().min(1).optional(),
+  parentId: z.string().trim().min(1).optional(),
   ...taskDetailsFields,
 });
 const updateTaskSchema = z
-  .strictObject({ title: taskTitle.optional(), done: z.boolean().optional(), ...taskDetailsFields })
+  .strictObject({
+    title: taskTitle.optional(),
+    done: z.boolean().optional(),
+    ...taskDetailsUpdateFields,
+  })
   .refine((changes) => Object.keys(changes).length > 0);
 
 const taskNotFound = { error: "找不到这条任务。" };

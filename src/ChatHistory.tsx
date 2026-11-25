@@ -1,13 +1,73 @@
-import { useEffect, useRef } from "react";
+import { Fragment, useEffect, useRef, type ReactNode } from "react";
 import type { ChatMessage } from "../shared/chat.ts";
 
-const examplePrompts = ["提醒我买牛奶", "看看我的待办", "今天有哪些任务到期？"];
+const examplePrompts = [
+  "帮我记一下今天交报告，优先级高，工作量中",
+  "帮我记一下买牛奶和取快递",
+  "今天有哪些任务到期？",
+  "看看我的待办",
+];
 
 interface ChatHistoryProps {
   messages: ChatMessage[];
   pending: boolean;
   taskPanelOpen: boolean;
   onSelectPrompt: (prompt: string) => void;
+}
+
+function renderInlineFormatting(text: string): ReactNode[] {
+  const parts = text.split(/(\*\*[^*]+\*\*)/gu);
+  return parts.map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return <strong key={index}>{part.slice(2, -2)}</strong>;
+    }
+    return <Fragment key={index}>{part}</Fragment>;
+  });
+}
+
+function renderMessageContent(content: string): ReactNode {
+  const lines = content.split("\n");
+  return lines.map((line, index) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return <div key={index} className="msg-gap" aria-hidden="true" />;
+    }
+
+    if (/^(?:  |\t)?↳\s+/u.test(line)) {
+      return (
+        <div key={index} className="msg-line msg-subitem">
+          <span className="msg-sub-marker" aria-hidden="true">
+            ↳
+          </span>
+          <span>{renderInlineFormatting(trimmed.replace(/^↳\s+/u, ""))}</span>
+        </div>
+      );
+    }
+
+    if (/^(?:•|-|\*)\s+/u.test(trimmed)) {
+      return (
+        <div key={index} className="msg-line msg-bullet">
+          <span className="msg-dot" aria-hidden="true" />
+          <span>{renderInlineFormatting(trimmed.replace(/^(?:•|-|\*)\s+/u, ""))}</span>
+        </div>
+      );
+    }
+
+    const headingMatch = /^(?:###?\s*)?(.+（\d+）)$/u.exec(trimmed);
+    if (headingMatch) {
+      return (
+        <div key={index} className="msg-line msg-section-title">
+          {renderInlineFormatting(headingMatch[1])}
+        </div>
+      );
+    }
+
+    return (
+      <div key={index} className="msg-line">
+        {renderInlineFormatting(line)}
+      </div>
+    );
+  });
 }
 
 export function ChatHistory({
@@ -18,21 +78,27 @@ export function ChatHistory({
 }: ChatHistoryProps) {
   const viewport = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;
+    const el = viewport.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, [messages, pending, taskPanelOpen]);
 
   return (
     <div className="scroll" ref={viewport} role="region" aria-label="聊天内容" tabIndex={0}>
       {messages.length === 0 ? (
         <section className="welcome">
-          <img src="/logo.png" alt="" />
-          <h1>小明智能体</h1>
-          <p>今天有什么待办？</p>
+          <div className="welcome-badge">
+            <img src="/logo.png" alt="" />
+          </div>
+          <h1>你好，我是小明</h1>
+          <p>用自然中文聊聊你的待办，我会帮你记下来、排优先级、盯到期日，并实时同步到右侧清单。</p>
           <div className="examples">
             {examplePrompts.map((prompt) => (
-              <button key={prompt} onClick={() => onSelectPrompt(prompt)}>
-                {prompt}
-                <span aria-hidden="true">↗</span>
+              <button key={prompt} type="button" onClick={() => onSelectPrompt(prompt)}>
+                <span>{prompt}</span>
+                <span className="example-arrow" aria-hidden="true">
+                  ↗
+                </span>
               </button>
             ))}
           </div>
@@ -42,10 +108,26 @@ export function ChatHistory({
           {messages.map((message, index) => (
             <div key={index} className={`message ${message.role}`}>
               <small>{message.role === "user" ? "你" : "小明智能体"}</small>
-              <div>{message.content}</div>
+              <div className="bubble">
+                {message.role === "assistant"
+                  ? renderMessageContent(message.content)
+                  : message.content}
+              </div>
             </div>
           ))}
-          {pending && <p role="status">正在回复…</p>}
+          {pending && (
+            <div className="message assistant is-thinking" role="status" aria-label="正在思考">
+              <small>小明智能体</small>
+              <div className="bubble thinking-bubble">
+                <span className="thinking-dots" aria-hidden="true">
+                  <i />
+                  <i />
+                  <i />
+                </span>
+                <span>正在处理…</span>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

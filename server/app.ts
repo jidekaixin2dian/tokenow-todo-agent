@@ -4,14 +4,28 @@ import { chatRequestSchema, type ChatMessage } from "../shared/chat.ts";
 import type { TaskStore } from "./task-store.ts";
 import { taskRouter } from "./tasks.ts";
 
+export interface AppStatus {
+  mode: "deepseek" | "offline";
+  model: string | null;
+}
+
 interface AppDependencies {
   reply(messages: ChatMessage[]): Promise<string>;
   tasks: TaskStore;
+  status?: AppStatus;
 }
 
-export function createApp({ reply, tasks }: AppDependencies) {
+export function createApp({
+  reply,
+  tasks,
+  status = { mode: "offline", model: null },
+}: AppDependencies) {
   const app = express();
   app.use(express.json({ limit: "1mb" }));
+
+  app.get("/api/status", (_req, res) => {
+    res.json(status);
+  });
 
   app.post("/api/chat", async (req, res) => {
     const input = chatRequestSchema.safeParse(req.body);

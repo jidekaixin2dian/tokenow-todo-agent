@@ -62,9 +62,18 @@ paths:
               properties:
                 title: { $ref: "#/components/schemas/Title" }
                 done: { type: boolean }
-                dueDate: { $ref: "#/components/schemas/DueDate" }
-                priority: { $ref: "#/components/schemas/Priority" }
-                effort: { $ref: "#/components/schemas/Effort" }
+                dueDate:
+                  oneOf:
+                    - { $ref: "#/components/schemas/DueDate" }
+                    - { type: "null" }
+                priority:
+                  oneOf:
+                    - { $ref: "#/components/schemas/Priority" }
+                    - { type: "null" }
+                effort:
+                  oneOf:
+                    - { $ref: "#/components/schemas/Effort" }
+                    - { type: "null" }
       responses:
         "200":
           description: 更新后的任务

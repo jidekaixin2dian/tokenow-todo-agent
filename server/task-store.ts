@@ -3,12 +3,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname } from "node:path";
 import { z } from "zod";
 import type { Task } from "../shared/task.ts";
-import type { TaskDetails } from "./task-schema.ts";
+import type { TaskDetails, TaskDetailsUpdate } from "./task-schema.ts";
 
 const storedTask = z.looseObject({ id: z.string(), title: z.string(), done: z.boolean() });
 const taskList = z.array(storedTask);
-type TaskChanges = Partial<Pick<Task, "title" | "done">> & TaskDetails;
-type TaskOptions = TaskDetails & { parentId?: string };
+export type TaskChanges = Partial<Pick<Task, "title" | "done">> & TaskDetailsUpdate;
+export type TaskOptions = TaskDetails & { parentId?: string };
 
 export interface TaskStore {
   list(): Task[];
@@ -17,10 +17,20 @@ export interface TaskStore {
   remove(id: string): boolean;
 }
 
+function cleanOptions(options?: TaskOptions): Partial<Task> {
+  if (!options) return {};
+  const cleaned: Partial<Task> = {};
+  if (options.dueDate !== undefined) cleaned.dueDate = options.dueDate;
+  if (options.priority !== undefined) cleaned.priority = options.priority;
+  if (options.effort !== undefined) cleaned.effort = options.effort;
+  if (options.parentId !== undefined) cleaned.parentId = options.parentId;
+  return cleaned;
+}
+
 export function createJsonTaskStore(filename: string): TaskStore {
   function list(): Task[] {
     if (!existsSync(filename)) return [];
-    return taskList.parse(JSON.parse(readFileSync(filename, "utf8")));
+    return taskList.parse(JSON.parse(readFileSync(filename, "utf8"))) as Task[];
   }
 
   // 同一服务进程内同步完成读写；替换文件前，原清单始终完整可读。
@@ -35,7 +45,7 @@ export function createJsonTaskStore(filename: string): TaskStore {
     list,
 
     create(title, options) {
-      const task = { id: randomUUID(), title, done: false, ...options };
+      const task: Task = { id: randomUUID(), title, done: false, ...cleanOptions(options) };
       save([...list(), task]);
       return task;
     },
@@ -45,7 +55,14 @@ export function createJsonTaskStore(filename: string): TaskStore {
       const task = tasks.find((item) => item.id === id);
       if (!task) return undefined;
 
-      Object.assign(task, changes);
+      for (const [key, value] of Object.entries(changes)) {
+        if (value === undefined) continue;
+        if (value === null) {
+          delete task[key];
+        } else {
+          task[key] = value;
+        }
+      }
       save(tasks);
       return task;
     },

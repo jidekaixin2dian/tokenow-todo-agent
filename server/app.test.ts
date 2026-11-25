@@ -8,16 +8,17 @@ import { test, type TestContext } from "node:test";
 import OpenAI from "openai";
 import type { ChatMessage } from "../shared/chat.ts";
 import { createAgent } from "./agent.ts";
-import { createApp } from "./app.ts";
-import { createDeepSeekInterpreter } from "./model.ts";
+import { createApp, type AppStatus } from "./app.ts";
+import { createDeepSeekAgentRunner } from "./model.ts";
 import { createJsonTaskStore, type TaskStore } from "./task-store.ts";
 
 interface TestAppOptions {
   filename?: string;
+  status?: AppStatus;
   agent?: (tasks: TaskStore) => (messages: ChatMessage[]) => Promise<string>;
 }
 
-async function startTestApp(t: TestContext, { filename, agent }: TestAppOptions = {}) {
+async function startTestApp(t: TestContext, { filename, status, agent }: TestAppOptions = {}) {
   if (!filename) {
     const directory = await mkdtemp(join(tmpdir(), "todo-agent-"));
     t.after(() => rm(directory, { recursive: true, force: true }));
@@ -27,6 +28,7 @@ async function startTestApp(t: TestContext, { filename, agent }: TestAppOptions 
   const conversations: ChatMessage[][] = [];
   const app = createApp({
     tasks,
+    status,
     reply:
       agent?.(tasks) ??
       (async (messages) => {
@@ -68,7 +70,7 @@ async function startTestApp(t: TestContext, { filename, agent }: TestAppOptions 
   return { request, conversations, filename, close, chat };
 }
 
-test("任务 API 可以创建、列出、修改和删除任务", async (t) => {
+test("任务 API 可以创建、列出、修改、清除可选字段和删除任务", async (t) => {
   const { request } = await startTestApp(t);
   const collection = "/api/tasks";
   assert.deepEqual(await request("GET", collection), { status: 200, body: [] });
@@ -82,9 +84,27 @@ test("任务 API 可以创建、列出、修改和删除任务", async (t) => {
   const item = collection + "/" + task.id;
   const completed = await request("PATCH", item, { done: true });
   assert.deepEqual(completed, { status: 200, body: { ...task, done: true } });
-  const renamed = await request("PATCH", item, { title: "买面包" });
-  assert.deepEqual(renamed, { status: 200, body: { ...task, title: "买面包", done: true } });
-  assert.deepEqual((await request("GET", collection)).body, [renamed.body]);
+  const renamed = await request("PATCH", item, {
+    title: "买面包",
+    dueDate: "2026-11-30",
+    priority: 1,
+    effort: "medium",
+  });
+  assert.deepEqual(renamed, {
+    status: 200,
+    body: {
+      ...task,
+      title: "买面包",
+      done: true,
+      dueDate: "2026-11-30",
+      priority: 1,
+      effort: "medium",
+    },
+  });
+
+  const cleared = await request("PATCH", item, { dueDate: null, priority: null, effort: null });
+  assert.deepEqual(cleared, { status: 200, body: { ...task, title: "买面包", done: true } });
+  assert.deepEqual((await request("GET", collection)).body, [cleared.body]);
 
   assert.deepEqual(await request("DELETE", item), { status: 204, body: null });
   assert.deepEqual((await request("GET", collection)).body, []);
@@ -93,6 +113,10 @@ test("任务 API 可以创建、列出、修改和删除任务", async (t) => {
 test("任务 API 拒绝无效输入并区分不存在的任务", async (t) => {
   const { request } = await startTestApp(t);
   assert.equal((await request("POST", "/api/tasks", { title: " " })).status, 400);
+  assert.equal(
+    (await request("POST", "/api/tasks", { title: "测试", parentId: "   " })).status,
+    400,
+  );
   assert.equal((await request("PATCH", "/api/tasks/missing", {})).status, 400);
   assert.equal((await request("PATCH", "/api/tasks/missing", { done: true })).status, 404);
   assert.equal((await request("DELETE", "/api/tasks/missing")).status, 404);
@@ -100,7 +124,7 @@ test("任务 API 拒绝无效输入并区分不存在的任务", async (t) => {
 
 test("更新已有 JSON 清单时保留其他任务和扩展字段", async (t) => {
   const { request, filename } = await startTestApp(t);
-  const first = { id: "a", title: "买牛奶", done: false, priority: 1 };
+  const first = { id: "a", title: "买牛奶", done: false, priority: 1, customTag: "keep" };
   const second = { id: "b", title: "取快递", done: false };
   await writeFile(filename, JSON.stringify([first, second]));
 
@@ -108,8 +132,15 @@ test("更新已有 JSON 清单时保留其他任务和扩展字段", async (t) =
   assert.deepEqual(createJsonTaskStore(filename).list(), [{ ...first, done: true }, second]);
 });
 
-test("聊天 API 只将有效的完整对话传给智能体，并返回其回复", async (t) => {
-  const { request, conversations } = await startTestApp(t);
+test("聊天 API 只将有效的完整对话传给智能体，并返回其回复与状态端点", async (t) => {
+  const { request, conversations } = await startTestApp(t, {
+    status: { mode: "deepseek", model: "deepseek-flash" },
+  });
+  assert.deepEqual(await request("GET", "/api/status"), {
+    status: 200,
+    body: { mode: "deepseek", model: "deepseek-flash" },
+  });
+
   const messages = [
     { role: "user", content: "你好" },
     { role: "assistant", content: "你好！" },
@@ -123,8 +154,8 @@ test("聊天 API 只将有效的完整对话传给智能体，并返回其回复
   assert.deepEqual(conversations, [messages]);
 });
 
-test("不用模型也能走完验收对话，服务重启后可以从聊天查到任务", async (t) => {
-  const { request, chat, filename, close } = await startTestApp(t, { agent: createAgent });
+test("离线降级模式完整走通官方验收对话、重启持久化与扩展动作", async (t) => {
+  const { chat, filename, close } = await startTestApp(t, { agent: createAgent });
   assert.match(await chat("帮我记一下买牛奶"), /已记下.*买牛奶/u);
   assert.match(await chat("再记一条取快递"), /已记下.*取快递/u);
   assert.match(await chat("我有哪些任务？"), /待办（2）\n• 买牛奶\n• 取快递/u);
@@ -133,156 +164,286 @@ test("不用模型也能走完验收对话，服务重启后可以从聊天查�
   assert.match(await chat("牛奶买好了"), /已经完成/u);
   assert.match(await chat("取快递这条删掉吧"), /已删除「取快递」/u);
   assert.match(await chat("再给我看看清单"), /待办（0）\n\n已完成（1）\n• 买牛奶/u);
-  const rows = (await request("GET", "/api/tasks")).body;
-  assert.deepEqual(
-    rows.map(({ title, done }: { title: string; done: boolean }) => ({ title, done })),
-    [{ title: "买牛奶", done: true }],
-  );
+
+  // 取消完成、改标题 & 「改为已完成」写法
+  assert.match(await chat("取消完成买牛奶"), /恢复为待办/u);
+  assert.match(await chat("把买牛奶改名为买脱脂牛奶"), /改名为「买脱脂牛奶」/u);
+  assert.match(await chat("把买脱脂牛奶改为已完成"), /已完成「买脱脂牛奶」/u);
 
   await close();
   const restarted = await startTestApp(t, { filename, agent: createAgent });
-  assert.match(await restarted.chat("看看我的待办"), /已完成（1）\n• 买牛奶/u);
-  assert.match(await restarted.chat("帮我记一下洗衣服"), /已记下「洗衣服」/u);
+  assert.match(await restarted.chat("看看我的待办"), /已完成（1）\n• 买脱脂牛奶/u);
+  assert.match(await restarted.chat("帮我记一下洗衣服和倒垃圾"), /洗衣服[\s\S]*倒垃圾/u);
   assert.match(await restarted.chat("衣服洗好了"), /已完成「洗衣服」/u);
+  const rows = (await restarted.request("GET", "/api/tasks")).body;
+  assert.equal(rows.length, 3);
 });
 
-test("匹配不唯一时保留原任务，用户可凭编号指定，否定、询问和批量命令不会写入", async (t) => {
+test("同名待办优先匹配、序号上下文消歧及否定/询问不写入", async (t) => {
   const { chat, request } = await startTestApp(t, { agent: createAgent });
   await chat("帮我记一下买牛奶");
-  await chat("帮我记一下热牛奶");
+  await chat("牛奶买好了");
+  await chat("帮我记一下买牛奶");
+  // 一条已完成 + 一条待办同名，标记完成自动命中待办那条
+  assert.match(await chat("牛奶买好了"), /已完成「买牛奶」/u);
+
+  await chat("帮我记一下买燕麦奶");
+  await chat("帮我记一下热燕麦奶");
   const readTasks = async () => (await request("GET", "/api/tasks")).body;
   const before = await readTasks();
 
-  const choices = await chat("删掉牛奶");
-  assert.match(choices, /多条相关任务/u);
-  assert.match(choices, /买牛奶（待办，#[0-9a-f]{8}）/u);
-  await chat("先别删除买牛奶");
-  await chat("牛奶买好了？");
-  await chat("删除买牛奶？");
-  await chat("完成热牛奶？");
-  await chat("帮我记一下");
-  await chat("删除不存在的任务");
-  await chat("帮我记一下洗衣服，然后删除买牛奶");
-  await chat("帮我记一下洗衣服，取快递这条删掉吧");
+  const choices = await chat("删掉燕麦奶");
+  assert.match(choices, /找到多条相关任务/u);
+  assert.match(choices, /1\. 买燕麦奶（待办，#[0-9a-f]{8}）/u);
+  assert.match(choices, /2\. 热燕麦奶（待办，#[0-9a-f]{8}）/u);
+
+  // 直接回复序号承接上一轮消歧
+  assert.match(await chat("第2个"), /已删除「热燕麦奶」/u);
+  assert.equal((await readTasks()).length, before.length - 1);
+
+  const snapshot = await readTasks();
+  await chat("先别删除买燕麦奶");
+  await chat("买燕麦奶完成了？");
   await chat("清空任务清单");
-  assert.deepEqual(await readTasks(), before);
-
-  assert.match(await chat(`删除 #${before[1].id.slice(0, 8)}`), /已删除「热牛奶」/u);
-  assert.deepEqual(await readTasks(), [before[0]]);
-  assert.match(await chat("能帮我完成买牛奶吗？"), /已完成「买牛奶」/u);
+  assert.deepEqual(await readTasks(), snapshot);
 });
 
-test("完成报告匹配完整的动作和对象，也能按标题操作以 # 开头的任务", async (t) => {
-  const { chat, request } = await startTestApp(t, { agent: createAgent });
-  await chat("帮我记一下买牛奶");
-  await chat("帮我记一下牛奶");
-  await chat("帮我记一下热牛奶");
-  assert.match(await chat("牛奶买好了"), /已完成「买牛奶」/u);
-  await chat("删除买牛奶");
-  assert.match(await chat("牛奶买好了"), /没找到「买牛奶」/u);
-  const rows = (await request("GET", "/api/tasks")).body;
-  assert.equal(rows.length, 2);
-  assert.ok(rows.every((row: { done: boolean }) => !row.done));
-
-  const named = "#" + rows[0].id.slice(0, 8);
-  await chat(`帮我记一下「${named}」`);
-  assert.match(await chat(`完成「${named}」`), /已完成/u);
-  const after = (await request("GET", "/api/tasks")).body;
-  assert.equal(after[0].done, false);
-  assert.equal(after[2].title, named);
-  assert.equal(after[2].done, true);
-});
-
-test("到期筛选、优先级、工作量和子任务都接入原任务 API", async (t) => {
+test("到期日、逾期提醒、优先级、工作量与树形子任务全链路", async (t) => {
+  // 2026-11-30 为星期一
   const agent = (tasks: TaskStore) =>
-    createAgent(tasks, undefined, () => new Date(2026, 10, 30, 23, 55));
+    createAgent(tasks, undefined, () => new Date(2026, 10, 30, 10, 0));
   const { chat, request } = await startTestApp(t, { agent });
-  await chat("帮我记一下今天交报告，优先级高，工作量中");
-  await chat("提醒我明天还书");
+
+  await request("POST", "/api/tasks", {
+    title: "交上月报销单",
+    dueDate: "2026-11-28",
+    priority: 1,
+  });
+  await chat("帮我记一下今天交报告 优先级高 工作量中");
+  await chat("提醒我下周三体检");
   await chat("给交报告加子任务整理资料");
+
   const today = await chat("今天有哪些任务到期？");
-  assert.match(today, /今天到期.*交报告/su);
-  assert.doesNotMatch(today, /还书|整理资料/u);
+  assert.match(today, /已逾期未完成（1）[\s\S]*交上月报销单/u);
+  assert.match(today, /今天到期（1）[\s\S]*交报告/u);
+  assert.doesNotMatch(today, /体检/u);
 
   await chat("把交报告的工作量改为小");
-  await chat("完成整理资料");
+  const subDoneReply = await chat("完成整理资料");
+  assert.match(subDoneReply, /全部完成/u);
+
+  await chat("取消交报告的截止日期");
   await chat("给整理资料加子任务不允许嵌套");
-  await chat("帮我记一下整理照片，到期2026-02-30");
+
   const rows = (await request("GET", "/api/tasks")).body;
-  assert.equal(rows.length, 3);
-  assert.deepEqual(rows[0], {
-    id: rows[0].id,
-    title: "交报告",
-    done: false,
-    dueDate: "2026-11-30",
-    priority: 1,
-    effort: "small",
-  });
-  assert.equal(rows[1].dueDate, "2026-12-01");
-  assert.deepEqual(rows[2], {
-    id: rows[2].id,
-    title: "整理资料",
-    done: true,
-    parentId: rows[0].id,
-  });
-  assert.equal(
-    (await request("POST", "/api/tasks", { title: "任务", parentId: "missing" })).status,
-    404,
-  );
-  assert.equal(
-    (await request("POST", "/api/tasks", { title: "任务", parentId: rows[2].id })).status,
-    400,
-  );
-  assert.equal((await request("PATCH", "/api/tasks/" + rows[0].id, { priority: 4 })).status, 400);
+  const report = rows.find((item: { title: string }) => item.title === "交报告");
+  const checkup = rows.find((item: { title: string }) => item.title === "体检");
+  const sub = rows.find((item: { title: string }) => item.title === "整理资料");
+
+  assert.equal(report.dueDate, undefined);
+  assert.equal(report.priority, 1);
+  assert.equal(report.effort, "small");
+  assert.equal(checkup.dueDate, "2026-12-09");
+  assert.equal(sub.parentId, report.id);
+  assert.equal(sub.done, true);
+
   assert.match(await chat("删除交报告"), /子任务已转为独立任务/u);
-  assert.deepEqual((await request("GET", "/api/tasks")).body, [
-    rows[1],
-    { id: rows[2].id, title: "整理资料", done: true },
-  ]);
+  const afterDelete = (await request("GET", "/api/tasks")).body;
+  const detached = afterDelete.find((item: { id: string }) => item.id === sub.id);
+  assert.equal(detached.parentId, undefined);
 });
 
-test("DeepSeek 路径只执行通过校验的意图，空响应、无效 JSON 和模型故障不写入任务", async (t) => {
-  let content = '{"action":"create","title":"归档票据"}';
-  let status = 200;
-  let calls = 0;
+test("DeepSeek Tool Calling 多轮智能体支持工具编排、错误自恢复与参数降级重试", async (t) => {
+  const requests: Array<Record<string, unknown>> = [];
+  let turn = 0;
+
   const client = new OpenAI({
-    apiKey: "local-test",
+    apiKey: "test-key",
     baseURL: "https://test.invalid",
     maxRetries: 0,
-    async fetch(url, init) {
-      assert.equal(String(url), "https://test.invalid/chat/completions");
-      const body = JSON.parse(String(init?.body));
-      assert.deepEqual(body.response_format, { type: "json_object" });
-      assert.equal(body.reasoning_effort, "none");
-      assert.equal(body.messages.at(-1).role, "user");
-      assert.ok(body.messages.length <= 9);
-      assert.doesNotMatch(JSON.stringify(body.messages), /敏感任务仅存本地/u);
-      calls++;
-      return Response.json(
-        { choices: [{ finish_reason: "stop", message: { content } }] },
-        { status },
-      );
+    async fetch(_url, init) {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      turn++;
+
+      // 第 1 次请求模拟自定义模型不支持 reasoning_effort 返回 400，验证自动去掉该字段重试
+      if (turn === 1) {
+        assert.equal(body.reasoning_effort, "none");
+        return Response.json(
+          { error: { message: "Unknown parameter: reasoning_effort" } },
+          { status: 400 },
+        );
+      }
+
+      // 第 2 次（重试后）：模型带 reasoning_content 调用 create_tasks（含 null 可选字段容错）
+      if (turn === 2) {
+        assert.equal(body.reasoning_effort, undefined);
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                reasoning_content: "用户要创建两条任务，先调用 create_tasks。",
+                tool_calls: [
+                  {
+                    id: "call_1",
+                    type: "function",
+                    function: {
+                      name: "create_tasks",
+                      arguments: JSON.stringify({
+                        items: [
+                          {
+                            title: "准备周五复盘PPT",
+                            dueDate: "2026-11-27",
+                            priority: 1,
+                            effort: "large",
+                          },
+                          { title: "买纯牛奶", dueDate: null, parentId: "" },
+                        ],
+                      }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+
+      // 第 3 次：验证 assistant 消息原样回传了 reasoning_content，且创建结果正常
+      if (turn === 3) {
+        const msgs = body.messages as Array<{
+          role: string;
+          content: string;
+          reasoning_content?: string;
+        }>;
+        const assistantMsg = msgs.at(-2);
+        assert.equal(assistantMsg?.role, "assistant");
+        assert.equal(assistantMsg?.reasoning_content, "用户要创建两条任务，先调用 create_tasks。");
+        const toolMsg = msgs.at(-1);
+        assert.equal(toolMsg?.role, "tool");
+        const parsed = JSON.parse(toolMsg.content);
+        assert.equal(parsed.ok, true);
+        assert.equal(parsed.created.length, 2);
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "stop",
+              message: {
+                role: "assistant",
+                content: "已记下 2 条待办：准备周五复盘PPT（高优先）和买纯牛奶。",
+              },
+            },
+          ],
+        });
+      }
+
+      // 第 4 次（第二轮用户模糊口语）：先调 list_tasks（含 null/空串容错），同时测试一个无效工具调用错误回传
+      if (turn === 4) {
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call_2",
+                    type: "function",
+                    function: {
+                      name: "list_tasks",
+                      arguments: JSON.stringify({ query: "", priority: null }),
+                    },
+                  },
+                  {
+                    id: "call_bad",
+                    type: "function",
+                    function: { name: "delete_task", arguments: "{invalid-json" },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+
+      // 第 5 次：模型读取 list_tasks 里的真实 ID，语义定位「买纯牛奶」并标完成
+      if (turn === 5) {
+        const msgs = body.messages as Array<{
+          role: string;
+          tool_call_id?: string;
+          content: string;
+        }>;
+        const listResult = JSON.parse(msgs.find((m) => m.tool_call_id === "call_2")!.content) as {
+          tasks: Array<{ id: string; title: string }>;
+        };
+        const badResult = JSON.parse(msgs.find((m) => m.tool_call_id === "call_bad")!.content);
+        assert.equal(badResult.ok, false);
+
+        const milk = listResult.tasks.find((item) => item.title === "买纯牛奶")!;
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call_3",
+                    type: "function",
+                    function: {
+                      name: "update_task",
+                      arguments: JSON.stringify({ id: milk.id, done: true }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+
+      // 第 6 次：返回自然回复
+      if (turn === 6) {
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "stop",
+              message: { role: "assistant", content: "好的，已把「买纯牛奶」标记为已完成。" },
+            },
+          ],
+        });
+      }
+
+      // 第 7 次：模拟 API 故障（401），验证友好兜底且不破坏任务
+      return Response.json({ error: { message: "Unauthorized" } }, { status: 401 });
     },
   });
-  const { chat, request } = await startTestApp(t, {
-    agent: (tasks) => createAgent(tasks, createDeepSeekInterpreter(client)),
-  });
-  await request("POST", "/api/tasks", { title: "敏感任务仅存本地" });
-  await chat("帮我记一下买草莓");
-  assert.equal(calls, 0);
-  assert.match(await chat("下班前得把票据扫描归档，你帮忙挂心上"), /已记下「归档票据」/u);
-  const before = (await request("GET", "/api/tasks")).body;
-  assert.equal(before.length, 3);
 
-  for (const text of ['{"action":"delete","target":"归档票据","also":"买草莓"}', "not-json", " "]) {
-    content = text;
-    await chat("那件事怎么处理");
-  }
-  content = '{"action":"delete","target":"归档票据"}';
-  await chat("请问有没有什么办法删任务？");
-  await chat("我想喝水");
-  status = 401;
-  await chat("烦请处理前面的事");
-  assert.equal(calls, 7);
-  assert.deepEqual((await request("GET", "/api/tasks")).body, before);
+  const { chat, request } = await startTestApp(t, {
+    agent: (tasks) =>
+      createAgent(
+        tasks,
+        createDeepSeekAgentRunner(client, "deepseek-flash"),
+        () => new Date(2026, 10, 25, 14, 0),
+      ),
+  });
+
+  const r1 = await chat("帮我记两件事：周五前准备复盘PPT（高优、工作量大），还有买纯牛奶");
+  assert.match(r1, /准备周五复盘PPT/u);
+
+  const r2 = await chat("刚刚顺路把牛奶抱回来了");
+  assert.match(r2, /买纯牛奶.*已完成/u);
+
+  const tasksAfter = (await request("GET", "/api/tasks")).body;
+  assert.equal(tasksAfter.length, 2);
+  assert.equal(tasksAfter.find((item: { title: string }) => item.title === "买纯牛奶").done, true);
+
+  const r3 = await chat("再帮我看看今天有什么事");
+  assert.match(r3, /暂时无法连接 DeepSeek 服务/u);
+  assert.deepEqual((await request("GET", "/api/tasks")).body, tasksAfter);
 });

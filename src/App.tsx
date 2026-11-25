@@ -1,6 +1,6 @@
-import { useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { ChatMessage } from "../shared/chat.ts";
-import { requestReply } from "./chat-client.ts";
+import { fetchAppStatus, requestReply, type AppStatusInfo } from "./chat-client.ts";
 import { ChatHistory } from "./ChatHistory.tsx";
 import { TaskPanel } from "./TaskPanel.tsx";
 
@@ -17,7 +17,33 @@ export default function App() {
   const [error, setError] = useState("");
   const [taskRevision, setTaskRevision] = useState(0);
   const [showTasks, setShowTasks] = useState(false);
+  const [pendingCount, setPendingCount] = useState(0);
+  const [status, setStatus] = useState<AppStatusInfo | null>(null);
   const input = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchAppStatus(controller.signal).then((info) => {
+      if (!controller.signal.aborted && info) setStatus(info);
+    });
+    return () => controller.abort();
+  }, []);
+
+  const handlePendingCountChange = useCallback((count: number) => {
+    setPendingCount(count);
+  }, []);
+
+  const handleQuickPrompt = useCallback((text: string) => {
+    setDraft(text);
+    setShowTasks(false);
+    requestAnimationFrame(() => {
+      const field = input.current;
+      if (field) {
+        field.focus();
+        field.setSelectionRange(text.length, text.length);
+      }
+    });
+  }, []);
 
   async function send(text: string) {
     const content = text.trim();
@@ -52,16 +78,49 @@ export default function App() {
       <header>
         <img src="/logo.png" alt="" />
         <strong>TokeNow</strong>
-        <span>小明智能体</span>
-        <button
-          className="task-toggle"
-          type="button"
-          aria-expanded={showTasks}
-          aria-controls="task-panel"
-          onClick={() => setShowTasks(!showTasks)}
-        >
-          任务清单
-        </button>
+        <span className="brand-sub">小明智能体</span>
+
+        <div className="header-right">
+          {status && (
+            <span
+              className={`mode-badge ${status.mode === "deepseek" ? "is-ai" : "is-offline"}`}
+              title={
+                status.mode === "deepseek"
+                  ? `已接入 DeepSeek 模型：${status.model}`
+                  : "未配置 DEEPSEEK_API_KEY，当前为本地离线规则模式"
+              }
+            >
+              <i className="mode-dot" aria-hidden="true" />
+              {status.mode === "deepseek" ? `DeepSeek · ${status.model}` : "离线规则模式"}
+            </span>
+          )}
+
+          {messages.length > 0 && (
+            <button
+              className="clear-chat"
+              type="button"
+              disabled={pending}
+              onClick={() => {
+                setMessages([]);
+                setError("");
+                input.current?.focus();
+              }}
+            >
+              新对话
+            </button>
+          )}
+
+          <button
+            className="task-toggle"
+            type="button"
+            aria-expanded={showTasks}
+            aria-controls="task-panel"
+            onClick={() => setShowTasks(!showTasks)}
+          >
+            任务清单
+            {pendingCount > 0 && <em className="toggle-badge">{pendingCount}</em>}
+          </button>
+        </div>
       </header>
       <div className="workspace">
         <main>
@@ -86,7 +145,7 @@ export default function App() {
               <textarea
                 aria-label="消息"
                 ref={input}
-                placeholder="输入消息…"
+                placeholder="告诉小明要记什么、完成了哪件，或问今天有哪些任务到期…"
                 rows={2}
                 value={draft}
                 readOnly={pending}
@@ -105,7 +164,12 @@ export default function App() {
             <small>Enter 发送 · Shift + Enter 换行</small>
           </div>
         </main>
-        <TaskPanel revision={taskRevision} open={showTasks} />
+        <TaskPanel
+          revision={taskRevision}
+          open={showTasks}
+          onPendingCountChange={handlePendingCountChange}
+          onQuickPrompt={handleQuickPrompt}
+        />
       </div>
     </div>
   );
