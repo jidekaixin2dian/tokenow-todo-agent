@@ -1082,7 +1082,7 @@ textarea::placeholder {
 }
 
 .task-node > .task-node-inner {
-  overflow: hidden;
+  min-height: 0;
 }
 
 .task-node.is-entering {
@@ -1095,6 +1095,11 @@ textarea::placeholder {
   opacity: 0;
   margin-top: 0;
   pointer-events: none;
+}
+
+.task-node.is-leaving > .task-node-inner,
+.subtask-wrap.is-leaving > div {
+  overflow: hidden;
 }
 
 .task-node.is-leaving .task-item,
@@ -1115,7 +1120,7 @@ textarea::placeholder {
 }
 
 .subtask-wrap > div {
-  overflow: hidden;
+  min-height: 0;
 }
 
 .task-item {
