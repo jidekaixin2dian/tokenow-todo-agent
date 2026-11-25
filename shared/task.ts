@@ -49,6 +49,25 @@ export function getTaskDueState(task: Task, today: string): DueState {
   return "upcoming";
 }
 
+function isoDateToUtcDay(isoDate: string): number {
+  const [year, month, day] = isoDate.split("-").map(Number);
+  return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+}
+
+/** 计算两个 YYYY-MM-DD 日历日期相差的整天数（目标减去基准；负数表示已逾期）。 */
+export function diffIsoDays(targetIso: string, baseIso: string): number {
+  return isoDateToUtcDay(targetIso) - isoDateToUtcDay(baseIso);
+}
+
+export function describeDueDistance(dueDate: string, today: string): string {
+  const diff = diffIsoDays(dueDate, today);
+  if (diff < 0) return `已逾期 ${-diff} 天`;
+  if (diff === 0) return "今天到期";
+  if (diff === 1) return "明天到期";
+  if (diff === 2) return "后天到期";
+  return `${diff} 天后到期`;
+}
+
 function shortDate(isoDate: string, today: string): string {
   return isoDate.slice(0, 4) === today.slice(0, 4) ? isoDate.slice(5) : isoDate;
 }

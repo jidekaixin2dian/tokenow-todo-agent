@@ -3,6 +3,8 @@ import { z } from "zod";
 import {
   addDaysToDate,
   buildTaskTree,
+  describeDueDistance,
+  diffIsoDays,
   effortLabels,
   getTaskDueState,
   isEffort,
@@ -273,12 +275,19 @@ export const agentTools: ChatCompletionTool[] = [
 function serializeTask(task: Task, today: string, titles: Map<string, string>, allTasks: Task[]) {
   const subtasks = allTasks.filter((item) => item.parentId === task.id);
   const doneSubtasks = subtasks.filter((item) => item.done).length;
+  const hasActiveDueDate = !task.done && typeof task.dueDate === "string";
   return {
     id: task.id,
     title: task.title,
     done: task.done,
     dueDate: typeof task.dueDate === "string" ? task.dueDate : undefined,
     dueState: getTaskDueState(task, today),
+    ...(hasActiveDueDate
+      ? {
+          dueOffsetDays: diffIsoDays(task.dueDate!, today),
+          dueRelative: describeDueDistance(task.dueDate!, today),
+        }
+      : {}),
     priority: isPriority(task.priority) ? task.priority : undefined,
     priorityLabel: isPriority(task.priority) ? priorityLabels[task.priority] : undefined,
     effort: isEffort(task.effort) ? task.effort : undefined,

@@ -778,3 +778,95 @@ test("DeepSeek 查询与截断回复不写入，含清空字样的任务标题�
     ["清空邮箱垃圾邮件"],
   );
 });
+
+test("DeepSeek 系统提示注入本周与下周日期对照，工具结果附带精确到期天数差", async (t) => {
+  useDefaultReasoningEffort(t);
+  let step = 0;
+  let capturedSystem = "";
+  let capturedOverview: Record<string, unknown> | undefined;
+
+  const client = new OpenAI({
+    apiKey: "test-key",
+    baseURL: "https://test.invalid",
+    maxRetries: 0,
+    async fetch(_url, init) {
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<{ role: string; content: string; tool_call_id?: string }>;
+      };
+      step++;
+      if (step === 1) {
+        capturedSystem = body.messages[0]?.content ?? "";
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call_overview",
+                    type: "function",
+                    function: { name: "get_schedule_overview", arguments: "{}" },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      const toolMsg = body.messages.find((message) => message.tool_call_id === "call_overview");
+      capturedOverview = JSON.parse(toolMsg!.content) as Record<string, unknown>;
+      return Response.json({
+        choices: [
+          {
+            finish_reason: "stop",
+            message: { role: "assistant", content: "今天有交水费到期，还书已逾期 2 天。" },
+          },
+        ],
+      });
+    },
+  });
+
+  // 2026-11-29 为星期日，同时验证周日时的本周/下周边界与跨月进位
+  const { chat, request } = await startTestApp(t, {
+    agent: (tasks) =>
+      createAgent(
+        tasks,
+        createDeepSeekAgentRunner(client, "deepseek-flash"),
+        () => new Date(2026, 10, 29, 9, 30),
+      ),
+  });
+
+  await request("POST", "/api/tasks", { title: "还书", dueDate: "2026-11-27" });
+  await request("POST", "/api/tasks", { title: "交水费", dueDate: "2026-11-29" });
+  await request("POST", "/api/tasks", { title: "体检", dueDate: "2026-12-03" });
+  const finished = (await request("POST", "/api/tasks", { title: "买牛奶", dueDate: "2026-11-29" }))
+    .body;
+  await request("PATCH", `/api/tasks/${finished.id}`, { done: true });
+
+  assert.match(await chat("今天有哪些任务到期？"), /交水费/u);
+
+  assert.match(capturedSystem, /今天 2026-11-29（星期日）/u);
+  assert.match(capturedSystem, /明天 2026-11-30（星期一）/u);
+  assert.match(capturedSystem, /后天 2026-12-01（星期二）/u);
+  assert.match(
+    capturedSystem,
+    /本周（周一至周日）：周一 2026-11-23[\s\S]*周日 2026-11-29（今天）/u,
+  );
+  assert.match(capturedSystem, /下周（周一至周日）：下周一 2026-11-30[\s\S]*下周日 2026-12-06/u);
+
+  const overdue = capturedOverview?.overdue as Array<Record<string, unknown>>;
+  const dueToday = capturedOverview?.dueToday as Array<Record<string, unknown>>;
+  const dueTodayDone = capturedOverview?.dueTodayDone as Array<Record<string, unknown>>;
+  const upcoming = capturedOverview?.upcoming7Days as Array<Record<string, unknown>>;
+
+  assert.equal(overdue[0].dueOffsetDays, -2);
+  assert.equal(overdue[0].dueRelative, "已逾期 2 天");
+  assert.equal(dueToday[0].dueOffsetDays, 0);
+  assert.equal(dueToday[0].dueRelative, "今天到期");
+  assert.equal(upcoming[0].dueOffsetDays, 4);
+  assert.equal(upcoming[0].dueRelative, "4 天后到期");
+  assert.equal(dueTodayDone[0].dueOffsetDays, undefined);
+  assert.equal(dueTodayDone[0].dueRelative, undefined);
+});
