@@ -3,7 +3,22 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#f8f9fc" />
+    <meta name="theme-color" content="#f7f8fc" />
+    <script>
+      (() => {
+        let saved = null;
+        try {
+          saved = localStorage.getItem("tokenow-theme");
+        } catch {}
+        const prefersDark =
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const dark = saved === "dark" || (saved !== "light" && prefersDark);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+        const meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute("content", dark ? "#0f141e" : "#f7f8fc");
+      })();
+    </script>
     <link rel="icon" href="/logo.png" />
     <link rel="stylesheet" href="/style.css" />
     <title>小明智能体 · TokeNow</title>

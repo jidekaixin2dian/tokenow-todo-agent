@@ -20,6 +20,25 @@ import {
 } from "./task-schema.ts";
 import type { TaskStore } from "./task-store.ts";
 
+export interface ToolTurnState {
+  mutations: string[];
+  deletedCount: number;
+  initialTaskCount: number;
+  bulkDeleteConfirmed: boolean;
+}
+
+export function createToolTurnState(
+  initialTaskCount: number,
+  bulkDeleteConfirmed: boolean,
+): ToolTurnState {
+  return {
+    mutations: [],
+    deletedCount: 0,
+    initialTaskCount,
+    bulkDeleteConfirmed,
+  };
+}
+
 function emptyToUndefined(value: unknown) {
   if (value === null || value === undefined) return undefined;
   if (typeof value === "string" && value.trim() === "") return undefined;
@@ -31,6 +50,9 @@ const optionalPriority = z.preprocess(emptyToUndefined, taskPriority.optional())
 const optionalEffort = z.preprocess(emptyToUndefined, taskEffort.optional());
 const optionalParentId = z.preprocess(emptyToUndefined, z.string().trim().min(1).optional());
 const optionalQuery = z.preprocess(emptyToUndefined, z.string().trim().min(1).max(100).optional());
+const optionalLimit = z.preprocess(emptyToUndefined, z.number().int().min(1).max(100).optional());
+
+const DEFAULT_LIST_LIMIT = 50;
 
 const listTasksArgsSchema = z.object({
   status: z.preprocess(emptyToUndefined, z.enum(["all", "pending", "done"]).optional()),
@@ -41,6 +63,7 @@ const listTasksArgsSchema = z.object({
   priority: optionalPriority,
   effort: optionalEffort,
   query: optionalQuery,
+  limit: optionalLimit,
 });
 
 const createTasksArgsSchema = z.object({
@@ -91,7 +114,7 @@ export const agentTools: ChatCompletionTool[] = [
     function: {
       name: "list_tasks",
       description:
-        "查询当前待办清单。支持按完成状态、到期情况、优先级、工作量或关键词筛选。执行完成、修改、删除或添加子任务前，如不确定精确任务 ID，应先调用此工具获取最新任务列表。",
+        "查询当前待办清单。支持按完成状态、到期情况、优先级、工作量、关键词或数量上限筛选。执行完成、修改、删除或添加子任务前，如不确定精确任务 ID，应先调用此工具获取最新任务列表。",
       parameters: {
         type: "object",
         properties: {
@@ -119,6 +142,12 @@ export const agentTools: ChatCompletionTool[] = [
             type: "string",
             description: "按任务标题关键词筛选（不区分大小写）。",
           },
+          limit: {
+            type: "integer",
+            minimum: 1,
+            maximum: 100,
+            description: "返回任务条数上限，默认 50，最大 100。",
+          },
         },
         additionalProperties: false,
       },
@@ -129,7 +158,7 @@ export const agentTools: ChatCompletionTool[] = [
     function: {
       name: "create_tasks",
       description:
-        "创建一条或多条任务/子任务（单次最多 10 条）。创建子任务时传入已有主任务的 parentId（仅支持一层子任务）。",
+        "原子创建一条或多条任务/子任务（单次最多 10 条）。整批预校验通过后一次性写入；创建子任务时传入已有主任务的 parentId（仅支持一层子任务）。",
       parameters: {
         type: "object",
         properties: {
@@ -210,7 +239,7 @@ export const agentTools: ChatCompletionTool[] = [
     function: {
       name: "delete_task",
       description:
-        "按精确 id 删除单条任务。删除主任务时，其子任务会自动转为独立任务。严禁在未获用户确认时清空大量任务。",
+        "按精确 id 删除单条任务。删除主任务时，其子任务会自动转为独立任务。单轮删除 3 条及以上或清空整张清单前，必须先获得用户明确确认，否则服务端会拒绝执行。",
       parameters: {
         type: "object",
         properties: {
@@ -276,6 +305,7 @@ export function executeAgentTool(
   tasks: TaskStore,
   now: Date,
   today: string,
+  turnState: ToolTurnState = createToolTurnState(tasks.list().length, false),
 ): Record<string, unknown> {
   const parsedJson = parseJsonArgs(rawArgs);
   if (!parsedJson.ok) return { ok: false, error: parsedJson.error };
@@ -285,7 +315,14 @@ export function executeAgentTool(
     const parsed = listTasksArgsSchema.safeParse(input);
     if (!parsed.success) return { ok: false, error: "list_tasks 参数无效。" };
 
-    const { status = "all", dueFilter = "all", priority, effort, query } = parsed.data;
+    const {
+      status = "all",
+      dueFilter = "all",
+      priority,
+      effort,
+      query,
+      limit = DEFAULT_LIST_LIMIT,
+    } = parsed.data;
     const allTasks = tasks.list();
     const titles = new Map(allTasks.map((item) => [item.id, item.title]));
     const normalizedQuery = query ? normalizeText(query) : "";
@@ -308,7 +345,8 @@ export function executeAgentTool(
       return true;
     });
 
-    const tree = buildTaskTree(filtered, today).map(({ task, subtasks }) => ({
+    const sliced = filtered.slice(0, limit);
+    const tree = buildTaskTree(sliced, today).map(({ task, subtasks }) => ({
       ...serializeTask(task, today, titles, allTasks),
       children: subtasks.map((child) => serializeTask(child, today, titles, allTasks)),
     }));
@@ -318,6 +356,8 @@ export function executeAgentTool(
       today,
       totalInStore: allTasks.length,
       matchedCount: filtered.length,
+      returnedCount: sliced.length,
+      truncated: filtered.length > sliced.length,
       summary: {
         pending: allTasks.filter((item) => !item.done).length,
         done: allTasks.filter((item) => item.done).length,
@@ -328,7 +368,7 @@ export function executeAgentTool(
           (item) => !item.done && getTaskDueState(item, today) === "today",
         ).length,
       },
-      tasks: filtered.map((item) => serializeTask(item, today, titles, allTasks)),
+      tasks: sliced.map((item) => serializeTask(item, today, titles, allTasks)),
       tree,
     };
   }
@@ -343,31 +383,28 @@ export function executeAgentTool(
       };
     }
 
-    const created: Array<Record<string, unknown>> = [];
+    // 在同一快照上预校验整批父级关系，避免校验失败后留下半截写入记录。
+    const snapshot = tasks.list();
     const warnings: string[] = [];
 
     for (const item of parsed.data.items) {
-      const current = tasks.list();
-      const titles = new Map(current.map((t) => [t.id, t.title]));
       if (item.parentId) {
-        const parent = current.find((t) => t.id === item.parentId);
+        const parent = snapshot.find((t) => t.id === item.parentId);
         if (!parent) {
           return {
             ok: false,
-            error: `找不到 parentId=${item.parentId} 对应的主任务，请先调用 list_tasks 确认。`,
-            createdSoFar: created,
+            error: `找不到 parentId=${item.parentId} 对应的主任务，整批均未写入，请先调用 list_tasks 确认。`,
           };
         }
         if (typeof parent.parentId === "string") {
           return {
             ok: false,
-            error: `「${parent.title}」已经是子任务，仅支持一层子任务，请选择主任务。`,
-            createdSoFar: created,
+            error: `「${parent.title}」已经是子任务，仅支持一层子任务，整批均未写入，请选择主任务。`,
           };
         }
       }
 
-      const duplicate = current.find(
+      const duplicate = snapshot.find(
         (existing) =>
           !existing.done &&
           normalizeText(existing.title) === normalizeText(item.title) &&
@@ -376,21 +413,31 @@ export function executeAgentTool(
       if (duplicate) {
         warnings.push(`清单中原本已有同名待办「${duplicate.title}」，本次仍按要求新增了一条。`);
       }
+    }
 
-      const task = tasks.create(item.title, {
+    const entries = parsed.data.items.map((item) => ({
+      title: item.title,
+      options: {
         dueDate: item.dueDate,
         priority: item.priority,
         effort: item.effort,
         parentId: item.parentId,
-      });
-      const updatedAll = tasks.list();
-      titles.set(task.id, task.title);
-      created.push(serializeTask(task, today, titles, updatedAll));
+      },
+    }));
+
+    const createdTasks = tasks.createMany
+      ? tasks.createMany(entries)
+      : entries.map((entry) => tasks.create(entry.title, entry.options));
+
+    const updatedAll = tasks.list();
+    const titles = new Map(updatedAll.map((item) => [item.id, item.title]));
+    for (const task of createdTasks) {
+      turnState.mutations.push(`新增「${task.title}」`);
     }
 
     return {
       ok: true,
-      created,
+      created: createdTasks.map((task) => serializeTask(task, today, titles, updatedAll)),
       ...(warnings.length ? { warnings } : {}),
     };
   }
@@ -434,6 +481,14 @@ export function executeAgentTool(
     const updated = tasks.update(id, changes);
     if (!updated) return { ok: false, error: "更新任务失败，任务可能已被删除。" };
 
+    if (changes.done === true) {
+      turnState.mutations.push(`标记完成「${updated.title}」`);
+    } else if (changes.done === false) {
+      turnState.mutations.push(`恢复待办「${updated.title}」`);
+    } else {
+      turnState.mutations.push(`更新「${updated.title}」`);
+    }
+
     const afterAll = tasks.list();
     const titles = new Map(afterAll.map((item) => [item.id, item.title]));
     const hints: string[] = [];
@@ -474,10 +529,26 @@ export function executeAgentTool(
       return { ok: false, error: `找不到 id=${parsed.data.id} 的任务，请先调用 list_tasks 核对。` };
     }
 
+    // 服务端硬护栏：未经用户明确二次确认，禁止单轮删除 3 条及以上或清空多条清单。
+    const nextDeletedCount = turnState.deletedCount + 1;
+    const wouldClearMultiTaskList =
+      turnState.initialTaskCount >= 2 && allTasks.length === 1 && turnState.deletedCount >= 1;
+    if (!turnState.bulkDeleteConfirmed && (nextDeletedCount >= 3 || wouldClearMultiTaskList)) {
+      return {
+        ok: false,
+        requiresConfirmation: true,
+        error:
+          "服务端安全护栏：单轮删除 3 条及以上或清空全部任务前，必须先向用户列出待删除任务并获得明确确认。",
+      };
+    }
+
     const detachedSubtasks = allTasks.filter((item) => item.parentId === existing.id).length;
     if (!tasks.remove(existing.id)) {
       return { ok: false, error: "删除失败，任务可能已不存在。" };
     }
+
+    turnState.deletedCount = nextDeletedCount;
+    turnState.mutations.push(`删除「${existing.title}」`);
 
     return {
       ok: true,
@@ -518,11 +589,17 @@ export function executeAgentTool(
         dueToday: dueToday.length,
         upcoming7Days: upcoming7Days.length,
       },
-      overdue: overdue.map((item) => serializeTask(item, today, titles, allTasks)),
-      dueToday: dueToday.map((item) => serializeTask(item, today, titles, allTasks)),
-      dueTodayDone: dueTodayDone.map((item) => serializeTask(item, today, titles, allTasks)),
-      upcoming7Days: upcoming7Days.map((item) => serializeTask(item, today, titles, allTasks)),
-      highPriority: highPriority.map((item) => serializeTask(item, today, titles, allTasks)),
+      overdue: overdue.slice(0, 20).map((item) => serializeTask(item, today, titles, allTasks)),
+      dueToday: dueToday.slice(0, 20).map((item) => serializeTask(item, today, titles, allTasks)),
+      dueTodayDone: dueTodayDone
+        .slice(0, 20)
+        .map((item) => serializeTask(item, today, titles, allTasks)),
+      upcoming7Days: upcoming7Days
+        .slice(0, 20)
+        .map((item) => serializeTask(item, today, titles, allTasks)),
+      highPriority: highPriority
+        .slice(0, 20)
+        .map((item) => serializeTask(item, today, titles, allTasks)),
     };
   }
 

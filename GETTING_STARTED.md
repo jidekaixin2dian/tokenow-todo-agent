@@ -16,10 +16,10 @@ npm run dev
 ## 接入 DeepSeek
 
 1. 在项目根目录将 `.env.example` 复制为 `.env`。
-2. 在 `.env` 中填写 [DeepSeek 开放平台](https://platform.deepseek.com/) 的 API Key。默认使用 `deepseek-flash`，可通过 `DEEPSEEK_MODEL` 切换其他兼容模型。
-3. 重启服务。服务端在 `server/model.ts` 中通过 `getModelClient()` 与 `createDeepSeekAgentRunner()` 发起标准 OpenAI 兼容的 Function Calling 多轮工具调用；若模型不支持 `reasoning_effort` 参数会自动降级重试。
+2. 在 `.env` 中填写 [DeepSeek 开放平台](https://platform.deepseek.com/) 的 API Key。默认使用 `deepseek-flash`，可通过 `DEEPSEEK_MODEL` 切换其他兼容模型，通过 `DEEPSEEK_REASONING_EFFORT`（`none` / `low` / `medium` / `high` / `max`）调整思考强度。
+3. 重启服务。服务端在 `server/model.ts` 中通过 `getModelClient()` 与 `createDeepSeekAgentRunner()` 发起标准 OpenAI 兼容的 Function Calling 多轮工具调用；启用后会向 DeepSeek 发送最近最多 16 条对话消息以及工具查询命中的任务片段（默认上限 50 条）。
 
-未配置 `DEEPSEEK_API_KEY` 时，服务自动运行在离线规则模式，仍可体验基础和扩展功能。
+未配置 `DEEPSEEK_API_KEY` 时，服务完全运行在本地离线规则模式，不向外部发送任何对话或任务数据。
 
 ## 代码入口
 

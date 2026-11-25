@@ -58,7 +58,7 @@ export function createAgent(tasks: TaskStore, runner?: AgentRunner, clock = () =
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`DeepSeek 调用失败：${message}`);
-        return "暂时无法连接 DeepSeek 服务，请检查网络、API Key 或稍后重试。";
+        return "暂时无法连接 DeepSeek 服务，当前清单未发生变化，请检查网络、API Key 或稍后重试。";
       }
     }
 
@@ -67,12 +67,8 @@ export function createAgent(tasks: TaskStore, runner?: AgentRunner, clock = () =
     const intent = readLocalIntent(content, now);
     if (!intent) return help;
 
-    if (
-      intent.action !== "list" &&
-      intent.action !== "clarify" &&
-      intent.action !== "select_choice" &&
-      isInquiry(content)
-    ) {
+    // 针对原始未去标点文本执行问句拦截，防止「删除第2条？」这类问句误触发写入。
+    if (intent.action !== "list" && intent.action !== "clarify" && isInquiry(content)) {
       return "如果要修改清单，请直接告诉我要做什么，例如「完成买牛奶」。";
     }
 
@@ -177,14 +173,15 @@ function resolvePreviousChoice(
   const codeMatch = /#([^）\s]+)）$/u.exec(pickedLine);
   if (!codeMatch) return undefined;
 
-  let action: "complete" | "reopen" | "delete" | undefined = overrideAction;
-  if (!action) {
-    if (lastAssistant.content.includes("要删除的任务")) action = "delete";
-    else if (lastAssistant.content.includes("要取消完成的任务")) action = "reopen";
-    else if (lastAssistant.content.includes("要完成的任务")) action = "complete";
-  }
-  if (!action) return undefined;
-  return { action, code: `#${codeMatch[1]}` };
+  let originalAction: "complete" | "reopen" | "delete" | undefined;
+  if (lastAssistant.content.includes("要删除的任务")) originalAction = "delete";
+  else if (lastAssistant.content.includes("要取消完成的任务")) originalAction = "reopen";
+  else if (lastAssistant.content.includes("要完成的任务")) originalAction = "complete";
+
+  if (!originalAction) return undefined;
+  // 防止用户用序号快捷回复暗中切换上一轮待确认动作
+  if (overrideAction && overrideAction !== originalAction) return undefined;
+  return { action: originalAction, code: `#${codeMatch[1]}` };
 }
 
 function describeTask(task: Task, parentTitle?: string, today?: string) {

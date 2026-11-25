@@ -197,7 +197,12 @@ test("同名待办优先匹配、序号上下文消歧及否定/询问不写入"
   assert.match(choices, /1\. 买燕麦奶（待办，#[0-9a-f]{8}）/u);
   assert.match(choices, /2\. 热燕麦奶（待办，#[0-9a-f]{8}）/u);
 
-  // 直接回复序号承接上一轮消歧
+  // 序号问句不得误触发删除
+  await chat("删除第2条？");
+  assert.equal((await readTasks()).length, before.length);
+
+  // 重新列出候选并直接回复序号承接上一轮消歧
+  await chat("删掉燕麦奶");
   assert.match(await chat("第2个"), /已删除「热燕麦奶」/u);
   assert.equal((await readTasks()).length, before.length - 1);
 
@@ -206,6 +211,12 @@ test("同名待办优先匹配、序号上下文消歧及否定/询问不写入"
   await chat("买燕麦奶完成了？");
   await chat("清空任务清单");
   assert.deepEqual(await readTasks(), snapshot);
+
+  // 用「和」连接的单个名词短语不应被误拆为两条
+  await chat("帮我记一下复习概率和统计");
+  const afterCourse = await readTasks();
+  assert.equal(afterCourse.length, snapshot.length + 1);
+  assert.equal(afterCourse.at(-1).title, "复习概率和统计");
 });
 
 test("到期日、逾期提醒、优先级、工作量与树形子任务全链路", async (t) => {
@@ -446,4 +457,163 @@ test("DeepSeek Tool Calling 多轮智能体支持工具编排、错误自恢复�
   const r3 = await chat("再帮我看看今天有什么事");
   assert.match(r3, /暂时无法连接 DeepSeek 服务/u);
   assert.deepEqual((await request("GET", "/api/tasks")).body, tasksAfter);
+});
+
+test("DeepSeek 服务端护栏：批量创建原子校验、未确认批量删除拦截、写入后总结超时返回确定性回执", async (t) => {
+  let step = 0;
+  const client = new OpenAI({
+    apiKey: "test-key",
+    baseURL: "https://test.invalid",
+    maxRetries: 0,
+    async fetch(_url, init) {
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<{ role: string; tool_call_id?: string; content: string }>;
+      };
+      step++;
+
+      // 第 1 轮：测试 create_tasks 第二项 parentId 无效，应整批拒绝且 0 条写入
+      if (step === 1) {
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "bad_batch",
+                    type: "function",
+                    function: {
+                      name: "create_tasks",
+                      arguments: JSON.stringify({
+                        items: [
+                          { title: "不应残留的任务" },
+                          { title: "坏子任务", parentId: "missing" },
+                        ],
+                      }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      if (step === 2) {
+        const res = JSON.parse(body.messages.at(-1)!.content);
+        assert.equal(res.ok, false);
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "stop",
+              message: { role: "assistant", content: "主任务不存在，整批未写入。" },
+            },
+          ],
+        });
+      }
+
+      // 第 2 轮：写入 3 条任务后，总结阶段返回 500，验证返回确定性已保存回执而非报错重试
+      if (step === 3) {
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "batch_ok",
+                    type: "function",
+                    function: {
+                      name: "create_tasks",
+                      arguments: JSON.stringify({
+                        items: [{ title: "任务A" }, { title: "任务B" }, { title: "任务C" }],
+                      }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      if (step === 4) {
+        return Response.json({ error: { message: "Upstream timeout" } }, { status: 500 });
+      }
+
+      // 第 3 轮：未经确认尝试一次删掉 3 条，服务端硬护栏应拦截第 3 条
+      if (step === 5) {
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "list_all",
+                    type: "function",
+                    function: { name: "list_tasks", arguments: "{}" },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      if (step === 6) {
+        const listRes = JSON.parse(body.messages.at(-1)!.content) as {
+          tasks: Array<{ id: string }>;
+        };
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: listRes.tasks.map((task, idx) => ({
+                  id: `del_${idx}`,
+                  type: "function",
+                  function: { name: "delete_task", arguments: JSON.stringify({ id: task.id }) },
+                })),
+              },
+            },
+          ],
+        });
+      }
+      const del2 = JSON.parse(body.messages.find((m) => m.tool_call_id === "del_2")!.content) as {
+        ok: boolean;
+        requiresConfirmation?: boolean;
+      };
+      assert.equal(del2.ok, false);
+      assert.equal(del2.requiresConfirmation, true);
+      return Response.json({
+        choices: [
+          {
+            finish_reason: "stop",
+            message: { role: "assistant", content: "批量删除需要你的确认。" },
+          },
+        ],
+      });
+    },
+  });
+
+  const { chat, request } = await startTestApp(t, {
+    agent: (tasks) => createAgent(tasks, createDeepSeekAgentRunner(client, "deepseek-flash")),
+  });
+
+  await chat("帮我加个任务和坏子任务");
+  assert.equal((await request("GET", "/api/tasks")).body.length, 0);
+
+  const receipt = await chat("帮我记下任务A、任务B、任务C");
+  assert.match(receipt, /已保存到你的清单[\s\S]*任务A[\s\S]*任务B[\s\S]*任务C/u);
+  assert.equal((await request("GET", "/api/tasks")).body.length, 3);
+
+  const guardReply = await chat("把这些全删了");
+  assert.match(guardReply, /确认/u);
+  assert.ok((await request("GET", "/api/tasks")).body.length >= 1);
 });

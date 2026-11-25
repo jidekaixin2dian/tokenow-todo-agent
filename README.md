@@ -22,8 +22,8 @@ npm run dev
 ### 接入 DeepSeek（启用完整智能体能力）
 
 1. 将 `.env.example` 复制为 `.env`。
-2. 在 `.env` 中填入自己的 `DEEPSEEK_API_KEY`（`.env` 已被 `.gitignore` 忽略，不会被提交到仓库）。
-3. 重启 `npm run dev`，页面右上角状态显示 `DeepSeek · deepseek-flash` 即表示接入成功。
+2. 在 `.env` 中填入自己的 `DEEPSEEK_API_KEY`（`.env` 已被 `.gitignore` 忽略，不会被提交到仓库）。默认模型 `deepseek-flash` 会使用低延迟模式，可通过 `DEEPSEEK_REASONING_EFFORT`（`none` / `low` / `medium` / `high` / `max`）按需调整思考强度。
+3. 重启 `npm run dev`，页面右上角状态显示 `已配置 · deepseek-flash` 即启用 DeepSeek 智能体。注意：启用后，对话请求会向 DeepSeek 发送最近最多 16 条对话消息以及工具查询命中的任务片段（默认最多 50 条）；留空 `DEEPSEEK_API_KEY` 则完全在本地离线运行。
 
 更多开发与接口调试方式见[本地开发指南](GETTING_STARTED.md)。
 

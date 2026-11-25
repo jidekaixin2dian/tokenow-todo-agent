@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, type CSSProperties, type ReactNode } from "react";
 import type { ChatMessage } from "../shared/chat.ts";
 
 const examplePrompts = [
@@ -77,24 +77,69 @@ export function ChatHistory({
   onSelectPrompt,
 }: ChatHistoryProps) {
   const viewport = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
+  const prevCount = useRef(messages.length);
+
+  function handleScroll() {
+    const el = viewport.current;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottom.current = distance <= 120;
+  }
+
   useEffect(() => {
     const el = viewport.current;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    const userJustSent = messages.length > prevCount.current && messages.at(-1)?.role === "user";
+    prevCount.current = messages.length;
+
+    if (userJustSent || stickToBottom.current) {
+      const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      el.scrollTo({ top: el.scrollHeight, behavior: reduced ? "auto" : "smooth" });
+    }
   }, [messages, pending, taskPanelOpen]);
 
+  // 监听视口与内容高度变化（抽屉展开、拖拽换宽、软键盘弹出），若用户原本贴底则即时校正。
+  useEffect(() => {
+    const el = viewport.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (stickToBottom.current) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+    observer.observe(el);
+    if (contentRef.current) observer.observe(contentRef.current);
+    return () => observer.disconnect();
+  }, [messages.length]);
+
   return (
-    <div className="scroll" ref={viewport} role="region" aria-label="聊天内容" tabIndex={0}>
+    <div
+      className="scroll"
+      ref={viewport}
+      onScroll={handleScroll}
+      role="region"
+      aria-label="聊天内容"
+      tabIndex={0}
+    >
       {messages.length === 0 ? (
         <section className="welcome">
           <div className="welcome-badge">
             <img src="/logo.png" alt="" />
           </div>
           <h1>你好，我是小明</h1>
-          <p>用自然中文聊聊你的待办，我会帮你记下来、排优先级、盯到期日，并实时同步到右侧清单。</p>
+          <p>
+            直接用口语告诉我你的安排，我会帮你记下来、排轻重缓急、盯紧到期日，右侧清单实时同步。
+          </p>
           <div className="examples">
-            {examplePrompts.map((prompt) => (
-              <button key={prompt} type="button" onClick={() => onSelectPrompt(prompt)}>
+            {examplePrompts.map((prompt, index) => (
+              <button
+                key={prompt}
+                type="button"
+                style={{ "--stagger": index } as CSSProperties}
+                onClick={() => onSelectPrompt(prompt)}
+              >
                 <span>{prompt}</span>
                 <span className="example-arrow" aria-hidden="true">
                   ↗
@@ -104,7 +149,13 @@ export function ChatHistory({
           </div>
         </section>
       ) : (
-        <div className="thread" role="log" aria-label="对话记录" aria-live="polite">
+        <div
+          className="thread"
+          ref={contentRef}
+          role="log"
+          aria-label="对话记录"
+          aria-live="polite"
+        >
           {messages.map((message, index) => (
             <div key={index} className={`message ${message.role}`}>
               <small>{message.role === "user" ? "你" : "小明智能体"}</small>
@@ -116,7 +167,7 @@ export function ChatHistory({
             </div>
           ))}
           {pending && (
-            <div className="message assistant is-thinking" role="status" aria-label="正在思考">
+            <div className="message assistant is-thinking" role="status" aria-label="小明正在处理">
               <small>小明智能体</small>
               <div className="bubble thinking-bubble">
                 <span className="thinking-dots" aria-hidden="true">
@@ -124,7 +175,7 @@ export function ChatHistory({
                   <i />
                   <i />
                 </span>
-                <span>正在处理…</span>
+                <span>正在整理…</span>
               </div>
             </div>
           )}

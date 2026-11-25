@@ -159,19 +159,37 @@ function readSingleCreation(content: string, now: Date, parent?: string) {
   return { item: { title: title.data, ...(parent ? { parent } : {}), ...details } };
 }
 
+const actionVerbStart =
+  /^(?:买|取|洗|交|写|寄|拿|倒|还|做|看|读|发|付|修|收|开|整理|准备|预约|打印|提交|复习|联系|回复|清理|打扫|购买|归还|下载|备份|更新|检查|核对|确认|报销|取走)/u;
+
 function readCreation(content: string, now: Date, parent?: string): Intent {
   const trimmed = content.trim();
   if (!trimmed) return { action: "clarify", reason: "title" };
 
-  // 支持「买牛奶和取快递」「买牛奶、取快递、交水费」这类轻量批量创建（不拆带引号或带属性的整句）。
+  // 支持明确批量分隔（、/以及），用「和」连接时仅当每一项都像独立待办动作才拆分，避免误拆「复习概率和统计」。
   const hasQuote = /[「『“"]/u.test(trimmed);
   const hasAttr = /(?:优先级|工作量|截止|到期)/u.test(trimmed);
-  if (!parent && !hasQuote && !hasAttr && /(?:和|以及|、)/u.test(trimmed)) {
-    const segments = trimmed
-      .split(/\s*(?:、|以及|和)\s*/u)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (segments.length >= 2 && segments.length <= 10) {
+  if (!parent && !hasQuote && !hasAttr) {
+    let segments: string[] | null = null;
+    if (/(?:、|以及)/u.test(trimmed)) {
+      segments = trimmed
+        .split(/\s*(?:、|以及)\s*/u)
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } else if (/和/u.test(trimmed)) {
+      const candidate = trimmed
+        .split(/\s*和\s*/u)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (
+        candidate.length >= 2 &&
+        candidate.every((part) => actionVerbStart.test(part) && [...part].length >= 2)
+      ) {
+        segments = candidate;
+      }
+    }
+
+    if (segments && segments.length >= 2 && segments.length <= 10) {
       const items = [];
       for (const segment of segments) {
         const parsed = readSingleCreation(segment, now);

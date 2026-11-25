@@ -13,6 +13,7 @@ export type TaskOptions = TaskDetails & { parentId?: string };
 export interface TaskStore {
   list(): Task[];
   create(title: string, options?: TaskOptions): Task;
+  createMany?(entries: Array<{ title: string; options?: TaskOptions }>): Task[];
   update(id: string, changes: TaskChanges): Task | undefined;
   remove(id: string): boolean;
 }
@@ -48,6 +49,18 @@ export function createJsonTaskStore(filename: string): TaskStore {
       const task: Task = { id: randomUUID(), title, done: false, ...cleanOptions(options) };
       save([...list(), task]);
       return task;
+    },
+
+    createMany(entries) {
+      if (entries.length === 0) return [];
+      const created: Task[] = entries.map(({ title, options }) => ({
+        id: randomUUID(),
+        title,
+        done: false,
+        ...cleanOptions(options),
+      }));
+      save([...list(), ...created]);
+      return created;
     },
 
     update(id, changes) {

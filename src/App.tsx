@@ -1,8 +1,24 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import type { ChatMessage } from "../shared/chat.ts";
+import { AnimatedNumber } from "./AnimatedNumber.tsx";
 import { fetchAppStatus, requestReply, type AppStatusInfo } from "./chat-client.ts";
 import { ChatHistory } from "./ChatHistory.tsx";
 import { TaskPanel } from "./TaskPanel.tsx";
+
+type Theme = "light" | "dark";
+
+const DEFAULT_PANEL_WIDTH = 356;
+const MIN_PANEL_WIDTH = 280;
+const MAX_PANEL_WIDTH = 520;
+const MOBILE_QUERY = "(max-width: 820px)";
 
 function isSendShortcut(event: KeyboardEvent<HTMLTextAreaElement>) {
   // 中文输入法会用 Enter 确认选词，部分浏览器此时只报告键码 229。
@@ -10,16 +26,78 @@ function isSendShortcut(event: KeyboardEvent<HTMLTextAreaElement>) {
   return event.key === "Enter" && !event.shiftKey && !composing;
 }
 
+function readInitialTheme(): Theme {
+  if (typeof document === "undefined") return "light";
+  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+}
+
+function readIsMobile(): boolean {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
+  return window.matchMedia(MOBILE_QUERY).matches;
+}
+
+function clampPanelWidth(width: number): number {
+  if (typeof window === "undefined") return width;
+  const maxAllowed = Math.max(
+    MIN_PANEL_WIDTH,
+    Math.min(MAX_PANEL_WIDTH, Math.round(window.innerWidth * 0.52)),
+  );
+  return Math.max(MIN_PANEL_WIDTH, Math.min(maxAllowed, width));
+}
+
 export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
+  const [renderedError, setRenderedError] = useState("");
   const [taskRevision, setTaskRevision] = useState(0);
   const [showTasks, setShowTasks] = useState(false);
+  const [isMobile, setIsMobile] = useState(readIsMobile);
   const [pendingCount, setPendingCount] = useState(0);
   const [status, setStatus] = useState<AppStatusInfo | null>(null);
+  const [theme, setTheme] = useState<Theme>(readInitialTheme);
+  const [panelWidth, setPanelWidth] = useState(DEFAULT_PANEL_WIDTH);
+  const [resizing, setResizing] = useState(false);
+
   const input = useRef<HTMLTextAreaElement>(null);
+  const toggleBtnRef = useRef<HTMLButtonElement>(null);
+  const themeTimerRef = useRef<number | null>(null);
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+
+  // 同步展示中的错误文本（收起时保留文本直至过渡完成再清空，避免文字先蒸发）
+  useEffect(() => {
+    if (error) setRenderedError(error);
+  }, [error]);
+
+  const applyTheme = useCallback((next: Theme, options: { animate: boolean; persist: boolean }) => {
+    const root = document.documentElement;
+    if (options.animate) {
+      root.classList.add("theme-animating");
+      if (themeTimerRef.current) window.clearTimeout(themeTimerRef.current);
+      themeTimerRef.current = window.setTimeout(() => {
+        root.classList.remove("theme-animating");
+        themeTimerRef.current = null;
+      }, 240);
+    }
+    root.dataset.theme = next;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", next === "dark" ? "#0f141e" : "#f7f8fc");
+    if (options.persist) {
+      try {
+        localStorage.setItem("tokenow-theme", next);
+      } catch {
+        // 忽略隐私模式存储限制
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (themeTimerRef.current) window.clearTimeout(themeTimerRef.current);
+      dragCleanupRef.current?.();
+    };
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -27,6 +105,151 @@ export default function App() {
       if (!controller.signal.aborted && info) setStatus(info);
     });
     return () => controller.abort();
+  }, []);
+
+  // 监听响应式断点与视口缩放，及时重夹紧右侧面板宽度
+  useEffect(() => {
+    const media = window.matchMedia(MOBILE_QUERY);
+    function onMediaChange(event: MediaQueryListEvent) {
+      setIsMobile(event.matches);
+      if (!event.matches) setShowTasks(false);
+    }
+    function onWindowResize() {
+      setPanelWidth((current) => clampPanelWidth(current));
+    }
+    media.addEventListener("change", onMediaChange);
+    window.addEventListener("resize", onWindowResize);
+    return () => {
+      media.removeEventListener("change", onMediaChange);
+      window.removeEventListener("resize", onWindowResize);
+    };
+  }, []);
+
+  // 持续跟随系统深浅色（仅当用户未主动手动选择过主题，且系统变化时不写入 localStorage）
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    function onChange(event: MediaQueryListEvent) {
+      try {
+        if (localStorage.getItem("tokenow-theme")) return;
+      } catch {
+        // 存储不可用时继续跟随系统
+      }
+      const next: Theme = event.matches ? "dark" : "light";
+      setTheme(next);
+      applyTheme(next, { animate: true, persist: false });
+    }
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, [applyTheme]);
+
+  const closeMobileDrawer = useCallback(() => {
+    setShowTasks(false);
+    requestAnimationFrame(() => toggleBtnRef.current?.focus());
+  }, []);
+
+  // 全局轻量快捷键：/ 聚焦输入，Esc 关闭移动端抽屉或错误提示
+  useEffect(() => {
+    function onKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") {
+        if (isMobile && showTasks) {
+          closeMobileDrawer();
+        } else if (error) {
+          setError("");
+        }
+        return;
+      }
+      if (
+        event.key === "/" &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        document.activeElement?.tagName !== "TEXTAREA" &&
+        document.activeElement?.tagName !== "INPUT"
+      ) {
+        event.preventDefault();
+        input.current?.focus();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isMobile, showTasks, error, closeMobileDrawer]);
+
+  const handleToggleTheme = useCallback(() => {
+    setTheme((current) => {
+      const next: Theme = current === "dark" ? "light" : "dark";
+      applyTheme(next, { animate: true, persist: true });
+      return next;
+    });
+  }, [applyTheme]);
+
+  const handleResizeStart = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      dragCleanupRef.current?.();
+
+      const target = event.currentTarget;
+      const pointerId = event.pointerId;
+      const startX = event.clientX;
+      const startWidth = panelWidth;
+
+      try {
+        target.setPointerCapture(pointerId);
+      } catch {
+        // 忽略合成测试事件捕获失败
+      }
+      setResizing(true);
+
+      function onMove(moveEvent: globalThis.PointerEvent) {
+        if (moveEvent.pointerId !== pointerId) return;
+        const delta = startX - moveEvent.clientX;
+        setPanelWidth(clampPanelWidth(startWidth + delta));
+      }
+
+      function cleanup() {
+        setResizing(false);
+        try {
+          if (target.hasPointerCapture(pointerId)) {
+            target.releasePointerCapture(pointerId);
+          }
+        } catch {}
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onEnd);
+        window.removeEventListener("pointercancel", onEnd);
+        dragCleanupRef.current = null;
+      }
+
+      function onEnd(endEvent: globalThis.PointerEvent) {
+        if (endEvent.pointerId !== pointerId) return;
+        cleanup();
+      }
+
+      dragCleanupRef.current = cleanup;
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onEnd);
+      window.addEventListener("pointercancel", onEnd);
+    },
+    [panelWidth],
+  );
+
+  const handleResizerKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 32 : 16;
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      setPanelWidth((w) => clampPanelWidth(w + step));
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      setPanelWidth((w) => clampPanelWidth(w - step));
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      setPanelWidth(MIN_PANEL_WIDTH);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      setPanelWidth(clampPanelWidth(MAX_PANEL_WIDTH));
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      setPanelWidth(clampPanelWidth(DEFAULT_PANEL_WIDTH));
+    }
   }, []);
 
   const handlePendingCountChange = useCallback((count: number) => {
@@ -60,7 +283,7 @@ export default function App() {
     } catch (cause) {
       setMessages(messages);
       setDraft(text);
-      setError(cause instanceof Error ? `发送失败：${cause.message}` : "发送失败，请重试。");
+      setError(cause instanceof Error ? `发送失败：${cause.message}` : "发送失败，请稍后重试。");
     } finally {
       setPending(false);
       requestAnimationFrame(() => {
@@ -74,7 +297,10 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div
+      className={resizing ? "app is-resizing" : "app"}
+      style={{ "--panel-width": `${panelWidth}px` } as CSSProperties}
+    >
       <header>
         <img src="/logo.png" alt="" />
         <strong>TokeNow</strong>
@@ -86,12 +312,12 @@ export default function App() {
               className={`mode-badge ${status.mode === "deepseek" ? "is-ai" : "is-offline"}`}
               title={
                 status.mode === "deepseek"
-                  ? `已接入 DeepSeek 模型：${status.model}`
-                  : "未配置 DEEPSEEK_API_KEY，当前为本地离线规则模式"
+                  ? `已配置 DEEPSEEK_API_KEY（模型：${status.model}），对话将由 DeepSeek 工具调用驱动`
+                  : "未配置 DEEPSEEK_API_KEY，当前在本地离线规则模式下运行"
               }
             >
               <i className="mode-dot" aria-hidden="true" />
-              {status.mode === "deepseek" ? `DeepSeek · ${status.model}` : "离线规则模式"}
+              {status.mode === "deepseek" ? `已配置 · ${status.model}` : "离线规则模式"}
             </span>
           )}
 
@@ -111,14 +337,49 @@ export default function App() {
           )}
 
           <button
+            className="icon-btn"
+            type="button"
+            aria-label={theme === "dark" ? "切换到浅色外观" : "切换到深色外观"}
+            title={theme === "dark" ? "切换到浅色外观" : "切换到深色外观"}
+            onClick={handleToggleTheme}
+          >
+            <svg className="theme-icon is-sun" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <circle cx="10" cy="10" r="3.6" stroke="currentColor" strokeWidth="1.6" />
+              <path
+                d="M10 2.5V4.2M10 15.8V17.5M2.5 10H4.2M15.8 10H17.5M4.7 4.7L5.9 5.9M14.1 14.1L15.3 15.3M15.3 4.7L14.1 5.9M5.9 14.1L4.7 15.3"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+              />
+            </svg>
+            <svg className="theme-icon is-moon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <path
+                d="M16.2 12.6A6.5 6.5 0 0 1 7.4 3.8a6.5 6.5 0 1 0 8.8 8.8Z"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
+
+          <button
+            ref={toggleBtnRef}
             className="task-toggle"
             type="button"
             aria-expanded={showTasks}
             aria-controls="task-panel"
-            onClick={() => setShowTasks(!showTasks)}
+            onClick={() => {
+              if (showTasks) closeMobileDrawer();
+              else setShowTasks(true);
+            }}
           >
             任务清单
-            {pendingCount > 0 && <em className="toggle-badge">{pendingCount}</em>}
+            {pendingCount > 0 && (
+              <em className="toggle-badge">
+                <AnimatedNumber value={pendingCount} compact />
+              </em>
+            )}
           </button>
         </div>
       </header>
@@ -131,11 +392,30 @@ export default function App() {
             onSelectPrompt={send}
           />
           <div className="compose">
-            {error && (
-              <p className="error" role="alert">
-                {error}
-              </p>
-            )}
+            <div
+              className={error ? "error-collapse is-visible" : "error-collapse"}
+              onTransitionEnd={(event) => {
+                if (event.target === event.currentTarget && !error) {
+                  setRenderedError("");
+                }
+              }}
+            >
+              <div>
+                {renderedError && (
+                  <p className="error" role="alert">
+                    <span>{renderedError}</span>
+                    <button
+                      type="button"
+                      className="error-dismiss"
+                      aria-label="关闭错误提示"
+                      onClick={() => setError("")}
+                    >
+                      ×
+                    </button>
+                  </p>
+                )}
+              </div>
+            </div>
             <form
               onSubmit={(event) => {
                 event.preventDefault();
@@ -157,16 +437,35 @@ export default function App() {
                   }
                 }}
               />
-              <button className="send" disabled={pending || !draft.trim()} aria-label="发送消息">
-                ↑
+              <button
+                className="send"
+                disabled={pending || !draft.trim()}
+                aria-label={pending ? "正在发送" : "发送消息"}
+              >
+                {pending ? <span className="send-spinner" aria-hidden="true" /> : "↑"}
               </button>
             </form>
-            <small>Enter 发送 · Shift + Enter 换行</small>
+            <small>Enter 发送 · Shift + Enter 换行 · 按 / 快速输入</small>
           </div>
         </main>
+        <div
+          className={resizing ? "panel-resizer is-active" : "panel-resizer"}
+          role="separator"
+          tabIndex={0}
+          aria-orientation="vertical"
+          aria-valuemin={MIN_PANEL_WIDTH}
+          aria-valuemax={MAX_PANEL_WIDTH}
+          aria-valuenow={panelWidth}
+          aria-label="拖动或用左右方向键调整任务清单宽度，双击或按回车恢复默认"
+          title="拖动调整宽度，双击恢复默认"
+          onPointerDown={handleResizeStart}
+          onKeyDown={handleResizerKeyDown}
+          onDoubleClick={() => setPanelWidth(clampPanelWidth(DEFAULT_PANEL_WIDTH))}
+        />
         <TaskPanel
           revision={taskRevision}
           open={showTasks}
+          isMobile={isMobile}
           onPendingCountChange={handlePendingCountChange}
           onQuickPrompt={handleQuickPrompt}
         />
