@@ -13,7 +13,8 @@
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint .",
     "lint:fix": "oxlint --fix .",
-    "predev": "npm run build"
+    "predev": "npm run build",
+    "eval": "node --env-file-if-exists=.env scripts/eval-agent.ts"
   },
   "dependencies": {
     "express": "^5.3.0",
