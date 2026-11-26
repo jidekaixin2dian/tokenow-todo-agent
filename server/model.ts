@@ -141,7 +141,7 @@ function trimHistoryContent(content: string): string {
   return `${content.slice(0, MAX_HISTORY_CONTENT_LENGTH)}\n…（较长历史内容已截断）`;
 }
 
-type DeleteTarget = Pick<Task, "id" | "title">;
+type DeleteTarget = Pick<Task, "id" | "title" | "done">;
 type ModelTurn = ChatCompletionMessageParam[];
 
 interface AgentSession {
@@ -180,7 +180,7 @@ function currentUserTurn(messages: ChatMessage[], prior?: AgentSession): string 
 }
 
 function isConfirmation(content: string): boolean {
-  return /^(?:确认(?:删除|清空)?|确定|是的?|好(?:的|吧)?|删吧|全部删(?:掉|除)?|清空吧|执行吧|继续|ok|yes)[。！!]?$/iu.test(
+  return /^(?:确认(?:删除|清空)?|确定(?:删除|清空)?|删吧|全部删(?:掉|除)?|清空吧|ok|yes)[。！!]?$/iu.test(
     content,
   );
 }
@@ -192,24 +192,35 @@ function isCancellation(content: string): boolean {
 }
 
 function deleteTargets(tasks: TaskStore, targets: DeleteTarget[]): string {
-  const existing = tasks.list();
-  const byId = new Map(existing.map((task) => [task.id, task]));
-  if (targets.some((target) => byId.get(target.id)?.title !== target.title)) {
-    return "待删除的任务已经变化。请重新指定要删除的任务。";
-  }
-  const ids = targets.map((target) => target.id);
-  const removed = new Set(ids);
-  const detached = existing.filter(
-    (item) => item.parentId && removed.has(item.parentId) && !removed.has(item.id),
-  ).length;
-  const success = tasks.removeMany
-    ? tasks.removeMany(ids)
-    : ids.length === 1 && tasks.remove(ids[0]);
-  if (!success) return "这次删除未能保存，请查看清单后重试。";
+  try {
+    const existing = tasks.list();
+    const byId = new Map(existing.map((task) => [task.id, task]));
+    if (
+      targets.some((target) => {
+        const current = byId.get(target.id);
+        return !current || current.title !== target.title || current.done !== target.done;
+      })
+    ) {
+      return "待删除的任务已经变化。请重新指定要删除的任务。";
+    }
+    const ids = targets.map((target) => target.id);
+    const removed = new Set(ids);
+    const detached = existing.filter(
+      (item) => item.parentId && removed.has(item.parentId) && !removed.has(item.id),
+    ).length;
+    const success = tasks.removeMany
+      ? tasks.removeMany(ids)
+      : ids.length === 1 && tasks.remove(ids[0]);
+    if (!success) return "这次删除未能保存，请查看清单后重试。";
 
-  const names = targets.map((target) => `「${target.title}」`).join("、");
-  const reply = `已删除${names}。`;
-  return detached ? `${reply}${detached} 条子任务已转为独立任务。` : reply;
+    const names = targets.map((target) => `「${target.title}」`).join("、");
+    const reply = `已删除${names}。`;
+    return detached ? `${reply}${detached} 条子任务已转为独立任务。` : reply;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`删除任务写入本地存储失败：${message}`);
+    return "本地清单保存失败，这次删除未能执行，请检查文件权限后重试。";
+  }
 }
 
 function formatCommittedReceipt(mutations: string[], summaryFailed: boolean): string {
@@ -324,10 +335,8 @@ export function createDeepSeekAgentRunner(
         return finish(text, turn, undefined, Boolean(explicitDelete && offersChoices));
       }
 
-      const allTasks = tasks.list();
       const requiresConfirmation =
-        targets.length >= 3 ||
-        (targets.length > 1 && targets.length === allTasks.length) ||
+        targets.length > 1 ||
         asksToClear ||
         turnState.invalidDelete ||
         !explicitDelete ||

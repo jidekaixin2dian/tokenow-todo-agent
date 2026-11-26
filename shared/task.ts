@@ -51,7 +51,9 @@ export function getTaskDueState(task: Task, today: string): DueState {
 
 function isoDateToUtcDay(isoDate: string): number {
   const [year, month, day] = isoDate.split("-").map(Number);
-  return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+  const utc = new Date(0);
+  utc.setUTCFullYear(year, month - 1, day);
+  return Math.floor(utc.getTime() / 86_400_000);
 }
 
 /** 计算两个 YYYY-MM-DD 日历日期相差的整天数（目标减去基准；负数表示已逾期）。 */

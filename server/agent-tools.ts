@@ -18,7 +18,7 @@ import type { TaskStore } from "./task-store.ts";
 
 export interface ToolTurnState {
   mutations: string[];
-  plannedDeletes: Map<string, Pick<Task, "id" | "title">>;
+  plannedDeletes: Map<string, Pick<Task, "id" | "title" | "done">>;
   allowWrites: boolean;
   onlyPlanDeletion: boolean;
   needsSeparateDeletion: boolean;
@@ -275,7 +275,8 @@ export const agentTools: ChatCompletionTool[] = [
 function serializeTask(task: Task, today: string, titles: Map<string, string>, allTasks: Task[]) {
   const subtasks = allTasks.filter((item) => item.parentId === task.id);
   const doneSubtasks = subtasks.filter((item) => item.done).length;
-  const hasActiveDueDate = !task.done && typeof task.dueDate === "string";
+  const hasActiveDueDate =
+    !task.done && typeof task.dueDate === "string" && isValidIsoDate(task.dueDate);
   return {
     id: task.id,
     title: task.title,
@@ -571,7 +572,7 @@ export function executeAgentTool(
       return { ok: false, error: `找不到 id=${parsed.data.id} 的任务，请先调用 list_tasks 核对。` };
     }
 
-    const planned = { id: existing.id, title: existing.title };
+    const planned = { id: existing.id, title: existing.title, done: existing.done };
     turnState.plannedDeletes.set(planned.id, planned);
     return {
       ok: true,

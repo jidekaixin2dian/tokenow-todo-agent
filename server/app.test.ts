@@ -870,3 +870,192 @@ test("DeepSeek 系统提示注入本周与下周日期对照，工具结果附�
   assert.equal(dueTodayDone[0].dueOffsetDays, undefined);
   assert.equal(dueTodayDone[0].dueRelative, undefined);
 });
+
+test("护栏回归：序号消歧免疫标题注入、问句与否定句禁写、删两条须确认且容错非法旧日期", async (t) => {
+  // 1) 离线序号消歧：标题含「要删除的任务」时，完成操作不得被误判为删除
+  const offline = await startTestApp(t, { agent: createAgent });
+  await offline.request("POST", "/api/tasks", { title: "整理要删除的任务" });
+  await offline.request("POST", "/api/tasks", { title: "检查要删除的任务" });
+  const prompt = await offline.chat("完成要删除的任务");
+  assert.match(prompt, /^找到多条相关任务.*要完成的任务/u);
+  assert.match(await offline.chat("第1个"), /已完成「整理要删除的任务」/u);
+  const offlineRows = (await offline.request("GET", "/api/tasks")).body;
+  assert.equal(offlineRows.length, 2);
+  assert.equal(offlineRows[0].done, true);
+  assert.equal(offlineRows[1].done, false);
+
+  // 2) DeepSeek 写权限拦截、删 2 条强制确认、状态变更中止确认、非法旧日期不产生 NaN
+  useDefaultReasoningEffort(t);
+  let step = 0;
+  let capturedTasks: Array<Record<string, unknown>> = [];
+  let milkId = "";
+  let parcelId = "";
+
+  const client = new OpenAI({
+    apiKey: "test-key",
+    baseURL: "https://test.invalid",
+    maxRetries: 0,
+    async fetch(_url, init) {
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<{ role: string; content: string; tool_call_id?: string }>;
+      };
+      step++;
+      // 回合 1：「帮我看看买牛奶完成了吗？」——模拟模型误调 update_task，应被 allowWrites=false 拦截
+      if (step === 1) {
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "bad_update",
+                    type: "function",
+                    function: {
+                      name: "update_task",
+                      arguments: JSON.stringify({ id: milkId, done: true }),
+                    },
+                  },
+                  {
+                    id: "read_list",
+                    type: "function",
+                    function: { name: "list_tasks", arguments: "{}" },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      if (step === 2) {
+        const blocked = JSON.parse(
+          body.messages.find((m) => m.tool_call_id === "bad_update")!.content,
+        );
+        assert.equal(blocked.ok, false);
+        const listRes = JSON.parse(
+          body.messages.find((m) => m.tool_call_id === "read_list")!.content,
+        ) as { tasks: Array<Record<string, unknown>> };
+        capturedTasks = listRes.tasks;
+        return Response.json({
+          choices: [
+            { finish_reason: "stop", message: { role: "assistant", content: "买牛奶还没完成。" } },
+          ],
+        });
+      }
+      // 回合 2：「我暂时不想删买牛奶」——模拟模型误调 delete_task，应被拦截
+      if (step === 3) {
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "bad_del",
+                    type: "function",
+                    function: { name: "delete_task", arguments: JSON.stringify({ id: milkId }) },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      if (step === 4) {
+        const blocked = JSON.parse(
+          body.messages.find((m) => m.tool_call_id === "bad_del")!.content,
+        );
+        assert.equal(blocked.ok, false);
+        return Response.json({
+          choices: [
+            { finish_reason: "stop", message: { role: "assistant", content: "好的，没有删除。" } },
+          ],
+        });
+      }
+      // 回合 3/5：3 条任务里删除 2 条（milk + parcel），必须进入二次确认
+      if (step === 5 || step === 8) {
+        return Response.json({
+          choices: [
+            {
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: `del_1_${step}`,
+                    type: "function",
+                    function: { name: "delete_task", arguments: JSON.stringify({ id: milkId }) },
+                  },
+                  {
+                    id: `del_2_${step}`,
+                    type: "function",
+                    function: { name: "delete_task", arguments: JSON.stringify({ id: parcelId }) },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      if (step === 6 || step === 9) {
+        return Response.json({
+          choices: [
+            { finish_reason: "stop", message: { role: "assistant", content: "已整理删除计划。" } },
+          ],
+        });
+      }
+      // 回合 4：「好的」不得触发删除计划，回到普通模型对话
+      return Response.json({
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "收到。" } }],
+      });
+    },
+  });
+
+  const ai = await startTestApp(t, {
+    agent: (tasks) =>
+      createAgent(
+        tasks,
+        createDeepSeekAgentRunner(client, "deepseek-flash"),
+        () => new Date(2026, 10, 26, 10, 0),
+      ),
+  });
+  // 写入含非法旧 dueDate 的历史数据，验证不会算出 NaN
+  await writeFile(
+    ai.filename,
+    JSON.stringify([
+      { id: "task-milk", title: "买牛奶", done: false, dueDate: "未知" },
+      { id: "task-parcel", title: "取快递", done: false },
+      { id: "task-water", title: "交水费", done: false },
+    ]),
+  );
+  milkId = "task-milk";
+  parcelId = "task-parcel";
+
+  assert.match(await ai.chat("帮我看看买牛奶完成了吗？"), /还没完成/u);
+  const legacyMilk = capturedTasks.find((item) => item.id === "task-milk");
+  assert.equal(legacyMilk?.dueOffsetDays, undefined);
+  assert.equal(legacyMilk?.dueRelative, undefined);
+
+  assert.match(await ai.chat("我暂时不想删买牛奶"), /没有删除/u);
+  assert.equal((await ai.request("GET", "/api/tasks")).body.length, 3);
+
+  // 3 条里删 2 条，必须弹出服务端确认提示
+  const confirmPrompt = await ai.chat("把买牛奶和取快递删掉");
+  assert.match(confirmPrompt, /待确认删除 2 条任务/u);
+  assert.equal((await ai.request("GET", "/api/tasks")).body.length, 3);
+
+  // 说「好的」不应误提交删除计划
+  await ai.chat("好的");
+  assert.equal((await ai.request("GET", "/api/tasks")).body.length, 3);
+
+  // 重新发起删 2 条后，在确认前修改其中一条 done 状态，确认时应中止保护
+  assert.match(await ai.chat("把买牛奶和取快递删掉"), /待确认删除 2 条任务/u);
+  await ai.request("PATCH", "/api/tasks/task-milk", { done: true });
+  assert.match(await ai.chat("确认删除"), /已经变化/u);
+  assert.equal((await ai.request("GET", "/api/tasks")).body.length, 3);
+});

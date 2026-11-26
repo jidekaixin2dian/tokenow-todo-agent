@@ -27,20 +27,40 @@ const clarification = {
     "请确认任务信息：日期支持「今天」「明天」「下周三」或 YYYY-MM-DD，优先级为高/中/低，工作量为小/中/大。",
 };
 
+function stripQuotedText(content: string) {
+  return content.replace(/「[^」]*」|『[^』]*』|“[^”]*”|"[^"]*"/gu, "");
+}
+
 function isInquiry(content: string) {
+  const plain = stripQuotedText(content).trim();
   if (
     /^(?:请问|(?:我)?想(?:问|知道|了解)|如果|假如|假设|举个?例|比如|怎么|怎样|如何|有没有)/u.test(
-      content,
+      plain,
     )
   ) {
     return true;
   }
-  const question = /(?:[？?]|[吗么呢][。！!]?)\s*$/u.test(content);
-  const request =
-    /^(?:(?:请|能不能|能否|可不可以|可以|能|麻烦你?)\s*)?(?:再\s*)?(?:帮我|给我|替我)|^(?:请|麻烦你?)\s*(?:把|将|记|添加|新增|删|移除|完成|勾选)/u.test(
-      content,
+  const question = /(?:[？?]|[吗么呢][。！!]?)\s*$/u.test(plain);
+  if (!question) return false;
+  // 「帮我看看买牛奶完成了吗？」这类带礼貌前缀的查询问句不应放行写权限。
+  const readQuestion =
+    /^(?:(?:请|能不能|能否|可不可以|可以|能|麻烦你?)\s*)?(?:再\s*)?(?:帮我|给我|替我)?\s*(?:看(?:看|一下)|查(?:查|看|一下)|确认一下|数一下)/u.test(
+      plain,
     );
-  return question && !request;
+  if (readQuestion) return true;
+  const request =
+    /^(?:(?:请|能不能|能否|可不可以|可以|能|麻烦你?)\s*)?(?:再\s*)?(?:帮我|给我|替我)\s*(?:把|将|记|添加|新增|创建|加|拆|删|移除|去掉|清空|完成|标记|勾选|改|取消)|^(?:请|麻烦你?)\s*(?:把|将|记|添加|新增|删|移除|完成|勾选)/u.test(
+      plain,
+    );
+  return !request;
+}
+
+function isWriteNegation(content: string, intent?: Intent) {
+  if (intent?.action === "create") return false;
+  const plain = stripQuotedText(content).trim();
+  return /(?:^(?:我)?(?:先|暂时|暂且|目前|现在)?(?:还是)?(?:不想|不要|不用|不必|别|无需|暂不)\s*(?:把|将)?[^，。！？?!]{0,12}(?:记|添加|新增|创建|删|移除|清空|改|标记|完成|勾选))|(?:(?:先别|暂时别|暂时不要|暂时不想|暂不|不要再)\s*(?:把|将)?[^，。！？?!]{0,12}(?:记|添加|新增|创建|删|移除|清空|改|标记|完成|勾选))|(?:^(?:算了|不用了|先不改|先不动|别动|不要动)[，。！!]?$)/u.test(
+    plain,
+  );
 }
 
 export function createAgent(tasks: TaskStore, runner?: AgentRunner, clock = () => new Date()) {
@@ -52,12 +72,14 @@ export function createAgent(tasks: TaskStore, runner?: AgentRunner, clock = () =
     const now = clock();
     const intent = readLocalIntent(content, now);
     const inquiry = isInquiry(content);
+    const negation = isWriteNegation(content, intent);
 
     // 配置了 DeepSeek 时，由真正的 Tool Calling 智能体主驱动全部对话。
     if (runner) {
       try {
         const allowWrites =
           !inquiry &&
+          !negation &&
           intent?.action !== "list" &&
           !(intent?.action === "clarify" && intent.reason === "cancelled");
         return await runner(messages, tasks, now, { conversationId, allowWrites });
@@ -172,16 +194,20 @@ function resolvePreviousChoice(
   if (!lastAssistant || !lastAssistant.content.includes("找到多条相关任务")) return undefined;
 
   const lines = lastAssistant.content.split("\n");
-  const pickedLine = lines.find((line) => line.startsWith(`${index}. `));
+  const header = lines[0] ?? "";
+  if (!header.startsWith("找到多条相关任务")) return undefined;
+
+  const pickedLine = lines.slice(1).find((line) => line.startsWith(`${index}. `));
   if (!pickedLine) return undefined;
 
   const codeMatch = /#([^）\s]+)）$/u.exec(pickedLine);
   if (!codeMatch) return undefined;
 
+  // 只从首行提示语识别原动作，避免候选任务标题自身含「要删除的任务」等字样造成误判。
   let originalAction: "complete" | "reopen" | "delete" | undefined;
-  if (lastAssistant.content.includes("要删除的任务")) originalAction = "delete";
-  else if (lastAssistant.content.includes("要取消完成的任务")) originalAction = "reopen";
-  else if (lastAssistant.content.includes("要完成的任务")) originalAction = "complete";
+  if (header.includes("要删除的任务")) originalAction = "delete";
+  else if (header.includes("要取消完成的任务")) originalAction = "reopen";
+  else if (header.includes("要完成的任务")) originalAction = "complete";
 
   if (!originalAction) return undefined;
   // 防止用户用序号快捷回复暗中切换上一轮待确认动作
